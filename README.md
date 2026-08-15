@@ -1,3 +1,9 @@
+[**English**](README.md) · [**简体中文**](README.zh.md)
+
+![License: MIT](https://img.shields.io/badge/license-MIT-green.svg)
+![DSH plugin](https://img.shields.io/badge/DeepSeek%20Harness-plugin-1f6feb.svg)
+![Tests: 33/33](https://img.shields.io/badge/tests-33%2F33-brightgreen.svg)
+
 # dsh-smart-compact
 
 A custom [`CompactionEngine`](https://github.com/DeepSeekAI/dsh) backend for the

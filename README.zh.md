@@ -1,3 +1,5 @@
+[**English**](README.md) · [**简体中文**](README.zh.md)
+
 # dsh-smart-compact
 
 DeepSeek Harness 的自定义 [`CompactionEngine`](https://github.com/DeepSeekAI/dsh) 后端：
