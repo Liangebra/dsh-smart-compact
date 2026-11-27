@@ -33,4 +33,21 @@ jobs:
             await ctx.fiber.dispose()
           }
           JS
+      - name: Verify tarball bundle through the DSH profile CLI
+        run: |
+          npm pack --pack-destination "$RUNNER_TEMP"
+          npm install -g --ignore-scripts pnpm@11 @deepseek-ai/dsh@0.2.3-alpha.2
+          export DSH_HOME="$RUNNER_TEMP/dsh-profile-smoke"
+          dsh plugin --profile tui add "$RUNNER_TEMP/dsh-smart-compact-0.2.1.tgz"
+          dsh --profile tui --dump-config > "$RUNNER_TEMP/dsh-config.yml"
+          cat "$RUNNER_TEMP/dsh-config.yml"
+          grep -q 'id: compaction-smart' "$RUNNER_TEMP/dsh-config.yml"
+          grep -q 'name: dsh-smart-compact' "$RUNNER_TEMP/dsh-config.yml"
+          node --input-type=module <<'JS'
+          import assert from 'node:assert/strict'
+          import fs from 'node:fs'
+          import path from 'node:path'
+          const manifest = JSON.parse(fs.readFileSync(path.join(process.env.DSH_HOME, 'profiles/tui/package.json'), 'utf8'))
+          assert.ok(manifest.dsh.profile.bundles.includes('dsh-smart-compact'))
+          JS
       - run: npm pack --dry-run
