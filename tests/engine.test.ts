@@ -2,6 +2,7 @@ import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import { Context } from '@deepseek-ai/cordis'
 import { ManualCompactionError } from '@deepseek-ai/dsh-compaction'
+import { CONTEXT_WINDOW_EXCEEDED_CODE } from '@deepseek-ai/dsh-llm'
 import { SmartCompactEngine } from '../src/index.ts'
 import { buildCompressibleSeqRanges, rebuildBlockLedger } from '../src/region.ts'
 import { buildTextSession, appendToolCall, appendToolResult } from './helpers.ts'
@@ -341,4 +342,37 @@ test('engine: streamed block completion does not duplicate the summary', async (
   const result = await engine.compactNow(agentOf(session) as Parameters<SmartCompactEngine['compactNow']>[0], new AbortController().signal)
   assert.ok(result)
   assert.equal(summaryText(result), 'SUMMARY')
+})
+
+test('lifecycle: mandatory pre-step compaction runs even with advisory nudges disabled', async () => {
+  const ctx = new Context()
+  ctx.provide('llm', fakeLlm('COMPRESSED'))
+  ctx.provide('tokenMeter', fakeMeter(95000))
+  engineWith(ctx, { autoNudge: false })
+  const session = buildTextSession(10)
+  const agent = agentOf(session)
+  const payload = { agent, modelSelection: agent.options, turn: 1, step: 1, messages: [],
+    signal: new AbortController().signal }
+  const decision = await ctx.waterfall('agent/pre-step', payload as never,
+    async () => ({ kind: 'enter' as const, messages: [] }))
+  assert.equal(decision.kind, 'enter')
+  assert.equal(rebuildBlockLedger(session.snapshotEvents()).length, 1)
+})
+
+test('lifecycle: overflow requests retry only after durable progress and at most once', async () => {
+  const ctx = new Context()
+  ctx.provide('llm', fakeLlm('COMPRESSED'))
+  ctx.provide('tokenMeter', fakeMeter(1000))
+  engineWith(ctx)
+  const session = buildTextSession(10)
+  const payload = { agent: agentOf(session), failure: { code: CONTEXT_WINDOW_EXCEEDED_CODE },
+    signal: new AbortController().signal }
+  const fallback = async () => ({ kind: 'fail' as const })
+  let delegated = 0
+  const next = async () => { delegated++; return fallback() }
+  const first = await ctx.waterfall('agent/request-error', payload as never, next as never)
+  assert.deepEqual(first, { kind: 'retry' })
+  assert.equal(rebuildBlockLedger(session.snapshotEvents()).length, 1)
+  await ctx.waterfall('agent/request-error', payload as never, next as never)
+  assert.equal(delegated, 1)
 })
