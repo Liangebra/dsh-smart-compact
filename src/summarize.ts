@@ -36,13 +36,13 @@ export async function summarizeRange(
   const seqs = shadowedSeqsOf(session, start, end)
   const parts: string[] = []
   for (const seq of seqs) {
-    const event = session.events[seq]
+    const event = session.snapshotEvents()[seq]
     if (event === undefined) continue
     parts.push(`[${event.type} seq ${seq}]\n${extractEventText(event)}`)
   }
   const messages = [createUserMessage({
     content: [{ type: 'text', text: buildSummaryPrompt(options.prompt, parts.join('\n\n')) }],
-    source: { kind: 'plugin', plugin: 'dsh-smart-compact' },
+    source: { kind: 'user' },
   })]
   let text = ''
   let current = ''
@@ -52,7 +52,6 @@ export async function summarizeRange(
     messages,
     maxTokens: options.maxTokens,
     signal: options.signal,
-    purpose: 'compaction',
   })) {
     if (chunk.type === 'text-delta') current += chunk.text
     else if (chunk.type === 'block-end' && chunk.block.type === 'text') {
