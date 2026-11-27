@@ -4,7 +4,7 @@
  */
 
 import { Session, type SessionId } from '@deepseek-ai/dsh-session'
-import { createAssistantMessage, createUserMessage, type CallId, type MessageId } from '@deepseek-ai/dsh-llm'
+import { createAssistantMessage, createUserMessage, type ToolCallId, createToolResultMessage } from '@deepseek-ai/dsh-llm'
 
 /** Long enough to produce meaningful token counts. */
 const LONG = 'JWT access tokens with 15 minute expiry and refresh tokens stored in Redis with 30 day TTL, implemented in src/auth/login.ts with sliding-window rate limiting at 10 requests per minute. '.repeat(20)
@@ -28,6 +28,7 @@ export function appendAssistant(session: Session, text: string, turn = 1, step =
   session.append('assistant/message', {
     turn,
     step,
+    stream: [],
     message: createAssistantMessage({
       content: [{ type: 'text', text }],
       source: { provider: 'test-provider', model: 'test-model' },
@@ -36,10 +37,11 @@ export function appendAssistant(session: Session, text: string, turn = 1, step =
 }
 
 export function appendToolCall(session: Session, text: string, callId: string, turn = 1, step = 1): void {
-  const id = callId as CallId
+  const id = callId as ToolCallId
   session.append('assistant/message', {
     turn,
     step,
+    stream: [],
     message: createAssistantMessage({
       content: [
         { type: 'text', text },
@@ -51,17 +53,11 @@ export function appendToolCall(session: Session, text: string, callId: string, t
 }
 
 export function appendToolResult(session: Session, text: string, callId: string, turn = 1, step = 1, isError = false): void {
-  const id = callId as CallId
+  const id = callId as ToolCallId
   session.append('tool/result', {
     turn,
     step,
-    message: {
-      id: `res-${callId}` as MessageId,
-      role: 'user',
-      content: [{ type: 'tool-result', toolCallId: id, content: [{ type: 'text', text }] }],
-      source: { kind: 'tool', callId: id },
-    },
-    ...(isError ? { isError: true } : {}),
+    message: createToolResultMessage({ callId: id, content: [{ type: 'text', text }], isError }),
   }, { surfaceOp: 'append' })
 }
 
