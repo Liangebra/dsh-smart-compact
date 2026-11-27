@@ -8,7 +8,7 @@
  * @module dsh-smart-compact/dcp
  */
 
-import type { Session } from '@deepseek-ai/dsh-session'
+import { SessionSeq, type Session } from '@deepseek-ai/dsh-session'
 import { extractText } from './messages.ts'
 import { resolveSurfaceRange } from './region.ts'
 
@@ -28,7 +28,7 @@ interface CallInfo {
 
 /** Tool-call blocks of an assistant message event. */
 function toolCallsOf(session: Session, seq: number): CallInfo[] {
-  const event = session.events[seq]
+  const event = session.snapshotEvents()[seq]
   if (event?.type !== 'assistant/message') return []
   const content = (event.data as { message?: { content?: unknown[] } }).message?.content ?? []
   const out: CallInfo[] = []
@@ -49,10 +49,10 @@ function toolCallsOf(session: Session, seq: number): CallInfo[] {
 /** The tool/result seq matching a callId (callId lives on message.source.callId). */
 function resultSeqFor(session: Session, callId: string, afterSeq: number): number | undefined {
   const nodes = session.surface.nodes
-  const index = nodes.indexOf(afterSeq)
+  const index = nodes.indexOf(SessionSeq(afterSeq))
   if (index < 0) return undefined
   for (const seq of nodes.slice(index + 1)) {
-    const event = session.events[seq]
+    const event = session.snapshotEvents()[seq]
     if (event?.type !== 'tool/result') continue
     const message = (event.data as { message?: { callId?: string; source?: { callId?: string } } }).message
     const candidate = message?.callId ?? message?.source?.callId
@@ -63,23 +63,23 @@ function resultSeqFor(session: Session, callId: string, afterSeq: number): numbe
 
 /** Whether a tool/result event carries an error marker. */
 function isErrored(session: Session, seq: number): boolean {
-  const event = session.events[seq]
+  const event = session.snapshotEvents()[seq]
   if (event?.type !== 'tool/result') return false
   const data = event.data as { isError?: boolean; message?: { content?: unknown } }
-  if (data.isError === true) return true
+  if (data.isError === true || (data.message as { isError?: boolean } | undefined)?.isError === true) return true
   const text = extractText(data.message?.content).toLowerCase()
   return /error|failed|exception|traceback|exit code|stderr/i.test(text)
 }
 
 /** Turn number of a surface event (0 when unknown). */
 function turnOf(session: Session, seq: number): number {
-  return (session.events[seq]?.data as { turn?: number } | undefined)?.turn ?? 0
+  return (session.snapshotEvents()[seq]?.data as { turn?: number } | undefined)?.turn ?? 0
 }
 
 /** Most recent turn number across the whole log (turn/start events). */
 export function latestTurn(session: Session): number {
   let max = 0
-  for (const event of session.events) {
+  for (const event of session.snapshotEvents()) {
     if (event.type !== 'turn/start') continue
     const turn = (event.data as { turn?: number }).turn ?? 0
     if (turn > max) max = turn
@@ -110,13 +110,13 @@ export function dedupSuggestions(session: Session): DcpSuggestion[] {
     const newest = calls[calls.length - 1]!
     const newestResult = resultSeqFor(session, newest.callId, newest.seq)
     if (newestResult === undefined || isErrored(session, newestResult)) continue
-    const newestText = extractText((session.events[newestResult]?.data as { message?: { content?: unknown } })?.message?.content)
+    const newestText = extractText((session.snapshotEvents()[newestResult]?.data as { message?: { content?: unknown } })?.message?.content)
     if (!newestText) continue
     for (const call of calls) {
       if (call === newest) continue
       const resultSeq = resultSeqFor(session, call.callId, call.seq)
       if (resultSeq === undefined || isErrored(session, resultSeq)) continue
-      const oldText = extractText((session.events[resultSeq]?.data as { message?: { content?: unknown } })?.message?.content)
+      const oldText = extractText((session.snapshotEvents()[resultSeq]?.data as { message?: { content?: unknown } })?.message?.content)
       if (oldText !== newestText) continue
       try {
         const { start, end } = resolveSurfaceRange(session, call.seq, resultSeq)
@@ -144,7 +144,7 @@ export function purgeSuggestions(session: Session, turns: number): DcpSuggestion
   const current = latestTurn(session)
   const out: DcpSuggestion[] = []
   for (const seq of session.surface.nodes) {
-    const event = session.events[seq]
+    const event = session.snapshotEvents()[seq]
     if (event?.type !== 'tool/result') continue
     if (current - turnOf(session, seq) < turns) continue
     if (!isErrored(session, seq)) continue
