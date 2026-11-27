@@ -91,7 +91,7 @@ test('region: protectedTools keeps the named tool call/result pair uncompressed'
   const toolCallSeq = session.surface.nodes.find((seq) => {
     const event = session.snapshotEvents()[seq]
     if (event?.type !== 'assistant/message') return false
-    return (event.data as { message?: { content?: Array<{ type?: string; name?: string }> } })
+    return (event.data as { message?: { content?: ReadonlyArray<{ type?: string; name?: string }> } })
       .message?.content?.some((block) => block.type === 'tool-call' && block.name === 'bash') === true
   })!
   assert.ok(toolCallSeq !== undefined)
