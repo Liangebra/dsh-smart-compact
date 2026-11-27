@@ -265,6 +265,48 @@ export function buildCompressibleSeqRanges(
   } = {},
 ): SeqCompressibleRange[] {
   const nodes = session.surface.nodes
+  const protectedSeqs = protectedSurfaceSeqs(session, opts)
+  const protectUserMessages = opts.protectUserMessages === true
+  const raw: SeqCompressibleRange[] = []
+  let cur: SeqCompressibleRange | null = null
+  const flush = (): void => {
+    if (cur !== null) raw.push(cur)
+    cur = null
+  }
+  for (const seq of nodes) {
+    const event = session.events[seq]
+    const isUser = event?.type === 'user/message' && !isCheckpointNode(event)
+    if (event === undefined || protectedSeqs.has(seq) || isCheckpointNode(event) || (protectUserMessages && isUser)) {
+      flush()
+      continue
+    }
+    const tokens = countTokens(extractEventText(event))
+    if (cur === null) {
+      cur = { start: seq, end: seq, count: 1, tokens }
+    } else {
+      cur = { start: cur.start, end: seq, count: cur.count + 1, tokens: cur.tokens + tokens }
+    }
+  }
+  flush()
+  const out: SeqCompressibleRange[] = []
+  for (const range of raw) {
+    try {
+      const { start, end } = resolveSurfaceRange(session, range.start, range.end)
+      const selected = shadowedSeqsOf(session, start, end)
+      const original = new Set(shadowedSeqsOf(session, range.start, range.end))
+      if (selected.some(seq => !original.has(seq))) continue
+      const tokens = selected.reduce((sum, seq) => sum + countTokens(extractEventText(session.events[seq]!)), 0)
+      out.push({ start, end, count: selected.length, tokens })
+    } catch {
+      // Cannot be balanced into a compressible span — skip.
+    }
+  }
+  return out.sort((a, b) => b.tokens - a.tokens)
+}
+
+/** Shared retention rules for automatic and model-directed compression. */
+export function protectedSurfaceSeqs(session: Session, opts: { preserveRecent?: number; protectedToolNames?: readonly string[]; protectUserMessages?: boolean } = {}): Set<number> {
+  const nodes = session.surface.nodes
   const preserve = opts.preserveRecent ?? 5
   const protectedToolNames = new Set(opts.protectedToolNames ?? [])
   const protectUserMessages = opts.protectUserMessages === true
@@ -302,39 +344,9 @@ export function buildCompressibleSeqRanges(
       }
     }
   }
-  const raw: SeqCompressibleRange[] = []
-  let cur: SeqCompressibleRange | null = null
-  const flush = (): void => {
-    if (cur !== null) raw.push(cur)
-    cur = null
-  }
   for (const seq of nodes) {
     const event = session.events[seq]
-    const isUser = event?.type === 'user/message' && !isCheckpointNode(event)
-    if (event === undefined || protectedSeqs.has(seq) || isCheckpointNode(event) || (protectUserMessages && isUser)) {
-      flush()
-      continue
-    }
-    const tokens = countTokens(extractEventText(event))
-    if (cur === null) {
-      cur = { start: seq, end: seq, count: 1, tokens }
-    } else {
-      cur = { start: cur.start, end: seq, count: cur.count + 1, tokens: cur.tokens + tokens }
-    }
+    if (event === undefined || isCheckpointNode(event) || (protectUserMessages && event.type === 'user/message')) protectedSeqs.add(seq)
   }
-  flush()
-  const out: SeqCompressibleRange[] = []
-  for (const range of raw) {
-    try {
-      const { start, end } = resolveSurfaceRange(session, range.start, range.end)
-      const selected = shadowedSeqsOf(session, start, end)
-      const original = new Set(shadowedSeqsOf(session, range.start, range.end))
-      if (selected.some(seq => !original.has(seq))) continue
-      const tokens = selected.reduce((sum, seq) => sum + countTokens(extractEventText(session.events[seq]!)), 0)
-      out.push({ start, end, count: selected.length, tokens })
-    } catch {
-      // Cannot be balanced into a compressible span — skip.
-    }
-  }
-  return out.sort((a, b) => b.tokens - a.tokens)
+  return protectedSeqs
 }
