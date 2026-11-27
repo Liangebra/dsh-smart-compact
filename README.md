@@ -6,7 +6,7 @@
 
 # dsh-smart-compact
 
-A custom [`CompactionEngine`](https://github.com/DeepSeekAI/dsh) backend for the
+A custom [`CompactionEngine`](https://github.com/deepseek-ai/deepseek-harness) backend for the
 DeepSeek Harness: configurable **threshold prompting**, a **mandatory
 auto-compaction** safety net at the limit, **DCP-style dedup / purge**
 suggestions, a fully **configurable summary prompt**, and a `/compact` command
@@ -34,6 +34,11 @@ compaction/start  →  compaction/summary  →  user/message (surface replace)  
 Original events are **never deleted**; block information is rebuilt from the
 log on demand (`rebuildBlockLedger`), so a crash, restart, or resumed session
 always sees a consistent picture.
+
+
+## Upstream compatibility
+
+This implementation was developed against DSH `0.1.0-rc.6`. The current upstream source (`0.2.3-alpha.2` at review time) adds routed-request pressure accounting, output headroom, model-switch compaction and optional tool-result pruning. Compatibility with that version has not yet been validated; the mount example below describes the original manual composition, not a verified marketplace installation. See the [upstream compaction reference](https://github.com/deepseek-ai/deepseek-harness/tree/master/packages/compaction/compaction-basic).
 
 ## Mount
 
