@@ -41,6 +41,7 @@ jobs:
             }
             p[section]['@deepseek-ai/dsh-commands'] = '0.2.3-alpha.2'
             p[section]['@deepseek-ai/cordis'] = '4.2.0-alpha.1'
+            p[section]['@deepseek-ai/schemastery'] = '3.20.0-alpha.1'
           }
           fs.writeFileSync('package.json', JSON.stringify(p, null, 2))
           JS
