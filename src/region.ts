@@ -331,7 +331,7 @@ export function protectedSurfaceSeqs(session: Session, opts: { preserveRecent?: 
     for (const seq of nodes) {
       const event = session.snapshotEvents()[seq]
       if (event?.type !== 'assistant/message') continue
-      const content = (event.data as { message?: { content?: Array<{ type?: string; name?: string; id?: string }> } })
+      const content = (event.data as { message?: { content?: ReadonlyArray<{ type?: string; name?: string; id?: string }> } })
         .message?.content
       for (const block of content ?? []) {
         if (block.type === 'tool-call' && block.name !== undefined && protectedToolNames.has(block.name)) {
