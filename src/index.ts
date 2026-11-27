@@ -44,6 +44,7 @@ import {
   buildCompressibleSeqRanges,
   completeCompaction,
   protectedSurfaceSeqs,
+  isCheckpointNode,
   rebuildBlockLedger,
   resolveSurfaceRange,
   runCompactionTransaction,
@@ -230,7 +231,11 @@ export class SmartCompactEngine extends CompactionEngine {
   private enforceProtection(session: import('@deepseek-ai/dsh-session').Session, start: number, end: number): void {
     const protectedSeqs = protectedSurfaceSeqs(session, this.rangeOpts())
     for (const seq of shadowedSeqsOf(session, start, end)) {
-      if (protectedSeqs.has(seq)) throw new Error(`dsh-smart-compact: span includes protected seq ${seq}; consult dcp_status`)
+      if (protectedSeqs.has(seq)) {
+        const event = session.events[seq]
+        const reason = event && isCheckpointNode(event) ? 'checkpoint' : event?.type === 'user/message' ? 'user message' : 'retained or protected tool content'
+        throw new Error(`dsh-smart-compact: span includes protected seq ${seq} (${reason}); consult dcp_status`)
+      }
     }
   }
 
