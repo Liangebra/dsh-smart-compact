@@ -48,17 +48,17 @@ function toolCallsOf(session: Session, seq: number): CallInfo[] {
 
 /** The tool/result seq matching a callId (callId lives on message.source.callId). */
 function resultSeqFor(session: Session, callId: string, afterSeq: number): number | undefined {
-  let fallback: number | undefined
-  for (const seq of session.surface.nodes) {
-    if (seq <= afterSeq) continue
+  const nodes = session.surface.nodes
+  const index = nodes.indexOf(afterSeq)
+  if (index < 0) return undefined
+  for (const seq of nodes.slice(index + 1)) {
     const event = session.events[seq]
     if (event?.type !== 'tool/result') continue
     const message = (event.data as { message?: { callId?: string; source?: { callId?: string } } }).message
     const candidate = message?.callId ?? message?.source?.callId
     if (candidate === callId) return seq
-    if (candidate === undefined) fallback ??= seq
   }
-  return fallback
+  return undefined
 }
 
 /** Whether a tool/result event carries an error marker. */
@@ -108,17 +108,23 @@ export function dedupSuggestions(session: Session): DcpSuggestion[] {
     if (calls.length < 2) continue
     // Keep the newest; suggest each older one.
     const newest = calls[calls.length - 1]!
+    const newestResult = resultSeqFor(session, newest.callId, newest.seq)
+    if (newestResult === undefined || isErrored(session, newestResult)) continue
+    const newestText = extractText((session.events[newestResult]?.data as { message?: { content?: unknown } })?.message?.content)
+    if (!newestText) continue
     for (const call of calls) {
       if (call === newest) continue
       const resultSeq = resultSeqFor(session, call.callId, call.seq)
-      if (resultSeq === undefined) continue
+      if (resultSeq === undefined || isErrored(session, resultSeq)) continue
+      const oldText = extractText((session.events[resultSeq]?.data as { message?: { content?: unknown } })?.message?.content)
+      if (oldText !== newestText) continue
       try {
         const { start, end } = resolveSurfaceRange(session, call.seq, resultSeq)
         out.push({
           kind: 'dedup',
           start,
           end,
-          reason: `duplicate tool call ${call.name} (same arguments) — the latest output is kept verbatim`,
+          reason: `duplicate tool call ${call.name} (same arguments and text output) — the latest output is kept verbatim`,
         })
       } catch {
         // Cannot be balanced — skip.
@@ -148,7 +154,7 @@ export function purgeSuggestions(session: Session, turns: number): DcpSuggestion
     // Find the assistant call before this result.
     let callSeq: number | undefined
     for (const node of session.surface.nodes) {
-      if (node >= seq) break
+      if (node === seq) break
       for (const call of toolCallsOf(session, node)) {
         if (call.callId === callId) callSeq = node
       }
@@ -160,7 +166,7 @@ export function purgeSuggestions(session: Session, turns: number): DcpSuggestion
         kind: 'purge',
         start,
         end,
-        reason: `errored tool call (${turns}+ turns old) — error message preserved, large input reclaimable`,
+        reason: `errored tool call (${turns}+ turns old) — summarize the error and large input together`,
       })
     } catch {
       // Cannot be balanced — skip.
