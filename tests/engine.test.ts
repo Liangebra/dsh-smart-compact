@@ -4,7 +4,7 @@ import { Context } from '@deepseek-ai/cordis'
 import { ManualCompactionError } from '@deepseek-ai/dsh-compaction'
 import { SmartCompactEngine } from '../src/index.ts'
 import { buildCompressibleSeqRanges, rebuildBlockLedger } from '../src/region.ts'
-import { buildTextSession } from './helpers.ts'
+import { buildTextSession, appendToolCall, appendToolResult } from './helpers.ts'
 
 function fakeLlm(text: string): { stream: () => AsyncIterable<unknown> } {
   return {
@@ -317,4 +317,28 @@ test('engine: pressure includes request overhead and reserves model output', asy
   const engine = engineWith(ctx, { headroomTokens: 5000 })
   const session = buildTextSession(10)
   assert.equal(await engine.measureRatio(agentOf(session)), 60000 / 75000)
+})
+
+test('engine: direct compression cannot replace protected tool pairs', async () => {
+  const ctx = new Context()
+  const engine = engineWith(ctx, { protectedTools: ['bash'], preserveRecent: 0 })
+  const session = buildTextSession(2)
+  appendToolCall(session, 'call', 'protected')
+  appendToolResult(session, 'large output '.repeat(100), 'protected')
+  const nodes = session.surface.nodes
+  await assert.rejects(engine.modelCompressRange(agentOf(session), nodes[2]!, nodes[3]!, 'summary'), /protected seq/)
+})
+test('engine: streamed block completion does not duplicate the summary', async () => {
+  const ctx = new Context()
+  ctx.provide('llm', {
+    async *stream() {
+      yield { type: 'text-delta', index: 0, text: 'SUMMARY' }
+      yield { type: 'block-end', index: 0, block: { type: 'text', text: 'SUMMARY' } }
+    },
+  })
+  const engine = engineWith(ctx)
+  const session = buildTextSession(10)
+  const result = await engine.compactNow(agentOf(session) as Parameters<SmartCompactEngine['compactNow']>[0], new AbortController().signal)
+  assert.ok(result)
+  assert.equal(summaryText(result), 'SUMMARY')
 })
