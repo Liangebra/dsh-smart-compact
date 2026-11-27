@@ -306,3 +306,15 @@ test('engine: direct paths never shadow a checkpoint or the latest user message'
   )
   assert.equal(rebuildBlockLedger(session.events).length, 1, 'no new block from refused spans')
 })
+
+test('engine: pressure includes request overhead and reserves model output', async () => {
+  const ctx = new Context()
+  ctx.provide('llm', {
+    ...fakeLlm('unused'),
+    resolveModelInfo: async () => ({ context: { contextWindow: 100000 }, defaultMaxTokens: 20000 }),
+  })
+  ctx.provide('tokenMeter', { measure: () => ({ totalTokens: 60000, surfaceTokens: 10000 }) })
+  const engine = engineWith(ctx, { headroomTokens: 5000 })
+  const session = buildTextSession(10)
+  assert.equal(await engine.measureRatio(agentOf(session)), 60000 / 75000)
+})
