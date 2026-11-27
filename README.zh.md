@@ -27,7 +27,20 @@ compaction/start  →  compaction/summary  →  user/message（surface 替换）
 
 ## 上游兼容性
 
-本版本面向 DSH `0.2.3-alpha.2` 与 Node.js 24+，在依赖清单和 lockfile 中固定已发布的 DSH 版本。CI 使用仓库中的依赖锁执行安装、类型检查、测试、构建和打包检查。后续 DSH 版本、插件市场及真实模型端到端会话尚未验证；下方为手动组合挂载方式。参见[官方压缩模块](https://github.com/deepseek-ai/deepseek-harness/tree/master/packages/compaction/compaction-basic)。
+本版本面向 DSH `0.2.3-alpha.2` 与 Node.js 24+，在依赖清单和 lockfile 中固定已发布的 DSH 版本。CI 使用仓库中的依赖锁执行安装、类型检查、测试、构建和打包检查。后续 DSH 版本及真实模型端到端会话尚未验证；本包提供基础 profile 的 bundle，亦可手动组合挂载。参见[官方压缩模块](https://github.com/deepseek-ai/deepseek-harness/tree/master/packages/compaction/compaction-basic)。
+
+## 安装（TUI / CLI 插件版）
+
+npm 版本正式发布后，直接安装到**现有 TUI 所使用的 profile**：
+
+```bash
+dsh plugin --profile tui add dsh-smart-compact@0.2.1
+dsh --profile tui
+```
+
+若你使用的 TUI profile 名为 `dsh-tui`、`pi-tui` 等，请将两条命令中的 `tui` 替换为实际名称。本包通过 DSH bundle 自动禁用基础 profile 的 `compaction-basic`，挂载 `compaction-smart`，不负责安装 TUI 本身。原有 `/compact` 命令继续使用当前压缩后端。可在对应 profile 的 `cordis.patch.yml` 中覆盖 `compaction-smart` 行来修改配置。
+
+卸载：`dsh plugin --profile tui remove dsh-smart-compact`，再重启 profile。请勿在同一作用域手动挂载第二个压缩后端。本 bundle 适用于基于 dsh-base 的 DSH 0.2.3-alpha.2 profile；拥有独立压缩后端的 Web preset 等需单独覆盖。
 
 ## 挂载
 
