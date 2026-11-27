@@ -233,7 +233,7 @@ export class SmartCompactEngine extends CompactionEngine {
     for (const seq of shadowedSeqsOf(session, start, end)) {
       if (protectedSeqs.has(seq)) {
         const event = session.events[seq]
-        const reason = event && isCheckpointNode(event) ? 'checkpoint' : event?.type === 'user/message' ? 'user message' : 'retained or protected tool content'
+        const reason = event && isCheckpointNode(event) ? 'checkpoint' : event?.type === 'user/message' ? 'latest user message or protected user message' : 'retained or protected tool content'
         throw new Error(`dsh-smart-compact: span includes protected seq ${seq} (${reason}); consult dcp_status`)
       }
     }
