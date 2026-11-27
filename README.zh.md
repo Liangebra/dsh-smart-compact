@@ -2,7 +2,7 @@
 
 # dsh-smart-compact
 
-DeepSeek Harness 的自定义 [`CompactionEngine`](https://github.com/DeepSeekAI/dsh) 后端：
+DeepSeek Harness 的自定义 [`CompactionEngine`](https://github.com/deepseek-ai/deepseek-harness) 后端：
 可配置的**阈值提示**、达到上限时的**强制自动压缩**安全网、**DCP 风格的去重 / 清理建议**、
 完全**可配置的摘要提示词**，以及保持原版行为的 `/compact` 命令。
 
@@ -23,6 +23,11 @@ compaction/start  →  compaction/summary  →  user/message（surface 替换）
 
 原始事件**永不删除**；块信息按需从日志重建（`rebuildBlockLedger`），所以崩溃、重启或
 恢复会话后看到的状态始终一致。
+
+
+## 上游兼容性
+
+本实现基于 DSH `0.1.0-rc.6` 开发。审查时上游源码已推进至 `0.2.3-alpha.2`，新增路由请求压力测算、输出预算预留、模型切换压缩及可选工具结果裁剪。尚未验证本插件与该版本的运行兼容性；下方挂载方式为原有手动组合方式，并非已经验证的插件市场安装流程。参见[官方压缩模块](https://github.com/deepseek-ai/deepseek-harness/tree/master/packages/compaction/compaction-basic)。
 
 ## 挂载
 
