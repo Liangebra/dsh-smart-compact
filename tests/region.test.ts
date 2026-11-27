@@ -43,6 +43,7 @@ test('region: transaction replaces the span and rebuilds a ledger block', () => 
   const ledger = rebuildBlockLedger(session.events)
   assert.equal(ledger.length, 1)
   assert.equal(ledger[0]!.summary, 'CHECKPOINT')
+  assert.equal(ledger[0]!.estimatedNetTokens, ledger[0]!.shadowedTokenCount - ledger[0]!.summaryTokens)
   assert.deepEqual(ledger[0]!.shadowedSeqs, shadowed)
   // Originals stay in the log; the surface no longer shows them.
   const onSurface = new Set(session.surface.nodes)
