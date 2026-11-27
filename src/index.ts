@@ -43,7 +43,7 @@ import {
   beginCompaction,
   buildCompressibleSeqRanges,
   completeCompaction,
-  isCheckpointNode,
+  protectedSurfaceSeqs,
   rebuildBlockLedger,
   resolveSurfaceRange,
   runCompactionTransaction,
@@ -228,34 +228,9 @@ export class SmartCompactEngine extends CompactionEngine {
    * non-monotonic seqs stay correct.
    */
   private enforceProtection(session: import('@deepseek-ai/dsh-session').Session, start: number, end: number): void {
-    const nodes = session.surface.nodes
-    const startIdx = nodes.indexOf(start)
-    const endIdx = nodes.indexOf(end)
-    if (startIdx < 0 || endIdx < 0) return // resolveSurfaceRange already validated
-    for (let index = startIdx; index <= endIdx; index += 1) {
-      const event = session.events[nodes[index]!]
-      if (event === undefined) continue
-      if (isCheckpointNode(event)) {
-        throw new Error(
-          `dsh-smart-compact: span ${start}..${end} includes a compaction checkpoint (seq ${nodes[index]}) — checkpoints are never shadowed; consult dcp_status`,
-        )
-      }
-      if (this.config.protectUserMessages && event.type === 'user/message') {
-        throw new Error(
-          `dsh-smart-compact: span ${start}..${end} includes a user message (seq ${nodes[index]}) — protectUserMessages keeps user content verbatim; consult dcp_status`,
-        )
-      }
-    }
-    for (let index = nodes.length - 1; index >= 0; index -= 1) {
-      const event = session.events[nodes[index]!]
-      if (event?.type === 'user/message' && !isCheckpointNode(event)) {
-        if (index >= startIdx && index <= endIdx) {
-          throw new Error(
-            `dsh-smart-compact: span ${start}..${end} shadows the latest user message (seq ${nodes[index]}) — the last instruction is never replaced; consult dcp_status`,
-          )
-        }
-        break
-      }
+    const protectedSeqs = protectedSurfaceSeqs(session, this.rangeOpts())
+    for (const seq of shadowedSeqsOf(session, start, end)) {
+      if (protectedSeqs.has(seq)) throw new Error(`dsh-smart-compact: span includes protected seq ${seq}; consult dcp_status`)
     }
   }
 
