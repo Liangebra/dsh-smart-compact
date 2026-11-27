@@ -10,6 +10,8 @@ export interface SmartCompactConfig {
   readonly modelContextLimit?: number
   /** Nudge line: usage >= this prompts the model to compress. Default 0.5. */
   readonly thresholdRatio: number
+  /** Additional input headroom beyond reserved output tokens. */
+  readonly headroomTokens: number
   /** Mandatory line: usage >= this demands compression and the engine auto-compacts if the model does not act. Default 0.9. */
   readonly mandatoryRatio: number
   /** Custom summary prompt template; `{content}` is replaced by the span's original text. */
@@ -34,6 +36,7 @@ export interface SmartCompactConfig {
 
 export const DEFAULT_CONFIG: SmartCompactConfig = {
   thresholdRatio: 0.5,
+  headroomTokens: 4096,
   mandatoryRatio: 0.9,
   summarizationMaxTokens: 8192,
   preserveRecent: 5,
@@ -64,5 +67,7 @@ export function resolveConfig(config: Partial<SmartCompactConfig> = {}): SmartCo
   if (!(resolved.purgeErroredTurns >= 0)) {
     throw new Error(`dsh-smart-compact: purgeErroredTurns must be non-negative, got ${resolved.purgeErroredTurns}`)
   }
+  if (!Number.isSafeInteger(resolved.headroomTokens) || resolved.headroomTokens < 0) throw new Error('dsh-smart-compact: headroomTokens must be a non-negative integer')
+  if (resolved.modelContextLimit !== undefined && (!Number.isSafeInteger(resolved.modelContextLimit) || resolved.modelContextLimit <= 0)) throw new Error('dsh-smart-compact: modelContextLimit must be a positive integer')
   return resolved
 }
