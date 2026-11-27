@@ -30,7 +30,7 @@ interface CallInfo {
 function toolCallsOf(session: Session, seq: number): CallInfo[] {
   const event = session.snapshotEvents()[seq]
   if (event?.type !== 'assistant/message') return []
-  const content = (event.data as { message?: { content?: unknown[] } }).message?.content ?? []
+  const content = (event.data as { message?: { content?: readonly unknown[] } }).message?.content ?? []
   const out: CallInfo[] = []
   for (const block of content) {
     if (block === null || typeof block !== 'object') continue
