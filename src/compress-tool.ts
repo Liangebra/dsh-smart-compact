@@ -146,7 +146,7 @@ export function makeTools(env: CompressEnv): ToolDefinition[] {
         lines.push('blocks:')
         for (const block of blocks) {
           lines.push(
-            `  ${block.blockId.slice(0, 8)} seqs ${block.start}..${block.end} (~${block.shadowedTokenCount} tokens reclaimed)`,
+            `  ${block.blockId.slice(0, 8)} seqs ${block.start}..${block.end} (~${block.estimatedNetTokens} net tokens saved; ${block.shadowedTokenCount} replaced, ${block.summaryTokens} summary)`,
           )
         }
       }
