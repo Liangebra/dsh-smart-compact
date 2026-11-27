@@ -1,3 +1,4 @@
+import { SessionSeq } from '@deepseek-ai/dsh-session'
 /**
  * dsh-smart-compact — a custom CompactionEngine backend with configurable
  * threshold prompting, a mandatory auto-compaction fallback, DCP-inspired
@@ -33,7 +34,7 @@ import {
 } from '@deepseek-ai/dsh-compaction'
 import type { Agent } from '@deepseek-ai/dsh-agent'
 import type { Context } from '@deepseek-ai/cordis'
-import type { CommandId } from '@deepseek-ai/dsh-commands/brand'
+import type { CommandId } from '@deepseek-ai/dsh-commands/types'
 import { createUserMessage, type ContentBlock } from '@deepseek-ai/dsh-llm'
 import { resolveConfig, type SmartCompactConfig } from './config.ts'
 import { DEFAULT_SUMMARY_PROMPT, buildSummaryPrompt } from './prompt.ts'
@@ -155,7 +156,7 @@ export class SmartCompactEngine extends CompactionEngine {
               suggestions,
             }),
           }],
-          source: { kind: 'plugin', plugin: 'dsh-smart-compact' },
+          source: { kind: 'user' },
         })
         return { kind: 'enter', messages: [...decision.messages, message] }
       })
@@ -232,7 +233,7 @@ export class SmartCompactEngine extends CompactionEngine {
     const protectedSeqs = protectedSurfaceSeqs(session, this.rangeOpts())
     for (const seq of shadowedSeqsOf(session, start, end)) {
       if (protectedSeqs.has(seq)) {
-        const event = session.events[seq]
+        const event = session.snapshotEvents()[seq]
         const reason = event && isCheckpointNode(event) ? 'checkpoint' : event?.type === 'user/message' ? 'latest user message or protected user message' : 'retained or protected tool content'
         throw new Error(`dsh-smart-compact: span includes protected seq ${seq} (${reason}); consult dcp_status`)
       }
@@ -276,7 +277,7 @@ export class SmartCompactEngine extends CompactionEngine {
     const shadowed = shadowedSeqsOf(session, s, e)
     let tokens = 0
     for (const seq of shadowed) {
-      const event = session.events[seq]
+      const event = session.snapshotEvents()[seq]
       if (event !== undefined) tokens += countTokens(extractEventText(event))
     }
     const provider = agent.options.provider ?? ''
@@ -305,7 +306,7 @@ export class SmartCompactEngine extends CompactionEngine {
       throw new Error('dsh-smart-compact: summary does not reduce estimated tokens')
     }
     const summary: ContentBlock[] = [{ type: 'text', text: summaryText }]
-    let landed: { compactionId: CompactionId; seqs: number[] }
+    let landed: { compactionId: CompactionId; seqs: SessionSeq[] }
     try {
       landed = completeCompaction(session, bracket, {
         start: s,
@@ -337,7 +338,7 @@ export class SmartCompactEngine extends CompactionEngine {
       summarySeq: seqs[1]!,
       endSeq: seqs[3]!,
       summary,
-      shadowedRange: { start: s, end: e },
+      shadowedRange: { start: SessionSeq(s), end: SessionSeq(e) },
       shadowedSeqs: [...shadowed],
       shadowedTokenCount: tokens,
     }
@@ -351,7 +352,7 @@ export class SmartCompactEngine extends CompactionEngine {
     const shadowed = shadowedSeqsOf(session, s, e)
     let tokens = 0
     for (const seq of shadowed) {
-      const event = session.events[seq]
+      const event = session.snapshotEvents()[seq]
       if (event !== undefined) tokens += countTokens(extractEventText(event))
     }
     if (!summaryText.trim() || countTokens(summaryText) >= tokens) throw new Error('dsh-smart-compact: summary must reduce estimated tokens')
@@ -373,7 +374,7 @@ export class SmartCompactEngine extends CompactionEngine {
       summarySeq: seqs[1]!,
       endSeq: seqs[3]!,
       summary,
-      shadowedRange: { start: s, end: e },
+      shadowedRange: { start: SessionSeq(s), end: SessionSeq(e) },
       shadowedSeqs: [...shadowed],
       shadowedTokenCount: tokens,
     }
