@@ -376,3 +376,49 @@ test('lifecycle: overflow requests retry only after durable progress and at most
   await ctx.waterfall('agent/request-error', payload as never, next as never)
   assert.equal(delegated, 1)
 })
+
+test('routing: compacts for the proposed smaller model using the last answered model', async () => {
+  const ctx = new Context()
+  let summaryModel: string | undefined
+  ctx.provide('llm', {
+    resolveModelInfo: async (_provider: string, model: string) =>
+      ({ context: { contextWindow: model === 'small' ? 30000 : 100000 } }),
+    async *stream(options: { model: string }) {
+      summaryModel = options.model
+      yield { type: 'text-delta', index: 0, text: 'COMPRESSED' }
+    },
+  })
+  const session = buildTextSession(10)
+  session.requestHeader = () => ({
+    config: { provider: 'test-provider', model: 'test-model' },
+  } as ReturnType<typeof session.requestHeader>)
+  const initialSize = session.surface.nodes.length
+  ctx.provide('tokenMeter', { measure: (_session: unknown, header?: { config: { model: string } }) => {
+    assert.equal(header?.config.model, 'small')
+    return { totalTokens: session.surface.nodes.length < initialSize ? 10000 : 28000 }
+  } })
+  new SmartCompactEngine(ctx, { autoTools: false, autoNudge: false, headroomTokens: 0 })
+  const target = { provider: 'test-provider', model: 'small', maxTokens: 5000 }
+  const agent = agentOf(session)
+  const payload = { agent, signal: new AbortController().signal }
+  const result = await ctx.waterfall('agent/request', payload as never, async () => target as never)
+  assert.deepEqual(result, target)
+  assert.equal(summaryModel, 'test-model')
+  assert.equal(rebuildBlockLedger(session.snapshotEvents()).length, 1)
+})
+
+test('routing: rejects an unsafe switch when no safe span can be compressed', async () => {
+  const ctx = new Context()
+  ctx.provide('llm', { ...fakeLlm('unused'),
+    resolveModelInfo: async () => ({ context: { contextWindow: 10000 } }) })
+  ctx.provide('tokenMeter', fakeMeter(20000))
+  const session = buildTextSession(2)
+  session.requestHeader = () => ({
+    config: { provider: 'test-provider', model: 'test-model' },
+  } as ReturnType<typeof session.requestHeader>)
+  new SmartCompactEngine(ctx, { autoTools: false, autoNudge: false, headroomTokens: 0 })
+  const payload = { agent: agentOf(session), signal: new AbortController().signal }
+  await assert.rejects(ctx.waterfall('agent/request', payload as never,
+    async () => ({ provider: 'test-provider', model: 'small' }) as never), /Cannot switch/)
+  assert.equal(rebuildBlockLedger(session.snapshotEvents()).length, 0)
+})
