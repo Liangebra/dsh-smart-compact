@@ -188,7 +188,10 @@ export class SmartCompactEngine extends CompactionEngine {
     if (meter === undefined) return 0
     const window = await this.windowFor(agent)
     if (window <= 0) return 0
-    return meter.measure(agent.session).surfaceTokens / window
+    const measurement = meter.measure(agent.session) as { surfaceTokens: number; totalTokens?: number }
+    const input = measurement.totalTokens ?? measurement.surfaceTokens
+    const budget = Math.max(1, window - this.config.summarizationMaxTokens - this.config.headroomTokens)
+    return input / budget
   }
 
   private llmOf(): LlmLike {
@@ -301,10 +304,15 @@ export class SmartCompactEngine extends CompactionEngine {
       throw this.manualError('summary', `summarization failed: ${message}`, error)
     }
     // Changed-span guard: the selected span must still be on the surface.
-    if (!shadowed.every((seq) => session.surface.nodes.includes(seq))) {
+    if (effectiveSignal.aborted || shadowedSeqsOf(session, s, e).join(',') !== shadowed.join(',')) {
       abortCompaction(session, bracket, 'span changed during summarization')
       if (!opts.manual) throw new Error('dsh-smart-compact: span changed during summarization')
       throw this.manualError('changed', 'span changed during summarization')
+    }
+    if (countTokens(summaryText) >= tokens) {
+      abortCompaction(session, bracket, 'summary does not reduce estimated tokens')
+      if (opts.manual) throw this.manualError('summary', 'summary does not reduce estimated tokens')
+      throw new Error('dsh-smart-compact: summary does not reduce estimated tokens')
     }
     const summary: ContentBlock[] = [{ type: 'text', text: summaryText }]
     let landed: { compactionId: CompactionId; seqs: number[] }
@@ -356,6 +364,7 @@ export class SmartCompactEngine extends CompactionEngine {
       const event = session.events[seq]
       if (event !== undefined) tokens += countTokens(extractEventText(event))
     }
+    if (!summaryText.trim() || countTokens(summaryText) >= tokens) throw new Error('dsh-smart-compact: summary must reduce estimated tokens')
     const summary: ContentBlock[] = [{ type: 'text', text: summaryText }]
     const { compactionId, seqs } = runCompactionTransaction(session, {
       start: s,
