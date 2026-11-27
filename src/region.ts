@@ -146,7 +146,7 @@ export function runCompactionTransaction(
 export function isCheckpointNode(event: SessionEvent): boolean {
   if (event.type !== 'user/message') return false
   const source = (event.data as { source?: { plugin?: string } }).source
-  return source?.plugin === 'compact'
+  return source?.plugin === 'compact' || (source as { kind?: string } | undefined)?.kind === 'compact-checkpoint'
 }
 
 /** Rebuild the block ledger from the log (authoritative, kernel-free). */
@@ -216,7 +216,6 @@ function nearestNode(session: Session, seq: number): number | undefined {
  */
 export function resolveSurfaceRange(session: Session, start: number, end: number): { start: number; end: number } {
   const nodes = session.surface.nodes
-  if (start > end) throw new Error(`dsh-smart-compact: reversed range ${start}..${end}`)
   let s = start
   let e = end
   if (nodes.indexOf(s) < 0) s = nearestNode(session, s) ?? s
@@ -234,7 +233,7 @@ export function resolveSurfaceRange(session: Session, start: number, end: number
   // Pass 1: shrink inward to the nearest clean cuts.
   while (startIdx <= endIdx && !cleanBefore(startIdx)) startIdx += 1
   while (endIdx >= startIdx && !cleanAfter(endIdx)) endIdx -= 1
-  if (startIdx <= endIdx && nodes[startIdx]! <= nodes[endIdx]!) {
+  if (startIdx <= endIdx) {
     return { start: nodes[startIdx]!, end: nodes[endIdx]! }
   }
 
@@ -243,7 +242,7 @@ export function resolveSurfaceRange(session: Session, start: number, end: number
   endIdx = nodes.indexOf(e)
   while (startIdx > 0 && !cleanBefore(startIdx)) startIdx -= 1
   while (endIdx < nodes.length - 1 && !cleanAfter(endIdx)) endIdx += 1
-  if (cleanBefore(startIdx) && cleanAfter(endIdx) && nodes[startIdx]! <= nodes[endIdx]!) {
+  if (cleanBefore(startIdx) && cleanAfter(endIdx)) {
     return { start: nodes[startIdx]!, end: nodes[endIdx]! }
   }
   throw new Error(`dsh-smart-compact: no tool-pairing-balanced range around ${start}..${end} — narrow the range`)
@@ -270,7 +269,7 @@ export function buildCompressibleSeqRanges(
   const protectedToolNames = new Set(opts.protectedToolNames ?? [])
   const protectUserMessages = opts.protectUserMessages === true
   const protectedSeqs = new Set<number>()
-  for (const seq of nodes.slice(-preserve)) protectedSeqs.add(seq)
+  for (const seq of preserve > 0 ? nodes.slice(-preserve) : []) protectedSeqs.add(seq)
   for (let index = nodes.length - 1; index >= 0; index -= 1) {
     const event = session.events[nodes[index]!]
     if (event?.type === 'user/message' && !isCheckpointNode(event)) {
@@ -316,10 +315,6 @@ export function buildCompressibleSeqRanges(
       flush()
       continue
     }
-    if (cur !== null && seq < cur.start) {
-      flush()
-      cur = null
-    }
     const tokens = countTokens(extractEventText(event))
     if (cur === null) {
       cur = { start: seq, end: seq, count: 1, tokens }
@@ -332,7 +327,11 @@ export function buildCompressibleSeqRanges(
   for (const range of raw) {
     try {
       const { start, end } = resolveSurfaceRange(session, range.start, range.end)
-      out.push({ start, end, count: range.count, tokens: range.tokens })
+      const selected = shadowedSeqsOf(session, start, end)
+      const original = new Set(shadowedSeqsOf(session, range.start, range.end))
+      if (selected.some(seq => !original.has(seq))) continue
+      const tokens = selected.reduce((sum, seq) => sum + countTokens(extractEventText(session.events[seq]!)), 0)
+      out.push({ start, end, count: selected.length, tokens })
     } catch {
       // Cannot be balanced into a compressible span — skip.
     }
