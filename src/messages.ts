@@ -19,9 +19,11 @@ export function extractText(content: unknown): string {
   const parts: string[] = []
   for (const block of content) {
     if (block === null || typeof block !== 'object') continue
-    const b = block as { type?: unknown; text?: unknown; content?: unknown }
+    const b = block as { type?: unknown; text?: unknown; content?: unknown; name?: unknown; arguments?: unknown }
     if (b.type === 'text' && typeof b.text === 'string') {
       parts.push(b.text)
+    } else if (b.type === 'tool-call') {
+      parts.push(`Tool: ${String(b.name ?? '')}\nArguments: ${typeof b.arguments === 'string' ? b.arguments : JSON.stringify(b.arguments ?? null)}`)
     } else if (Array.isArray(b.content)) {
       parts.push(extractText(b.content))
     }
