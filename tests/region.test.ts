@@ -118,3 +118,8 @@ test('region: resolveSurfaceRange snaps stale edges to live nodes', () => {
   const { start } = resolveSurfaceRange(session, nodes[0]!, nodes[nodes.length - 1]!)
   assert.ok(nodes.includes(start))
 })
+
+ test('region: zero retained nodes does not protect the entire surface', () => {
+  const session = buildTextSession(10)
+  assert.ok(buildCompressibleSeqRanges(session, { preserveRecent: 0 }).length > 0)
+})
