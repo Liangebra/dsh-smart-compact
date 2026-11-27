@@ -30,6 +30,8 @@ export interface BlockLedgerEntry {
   readonly start: number
   readonly end: number
   readonly createdAt: number
+  readonly summaryTokens: number
+  readonly estimatedNetTokens: number
 }
 
 /** One self-computed compressible span of the current surface. */
@@ -171,9 +173,13 @@ export function rebuildBlockLedger(events: readonly SessionEvent[]): BlockLedger
         if (original !== undefined) shadowedTokenCount += countTokens(extractEventText(original))
       }
     }
+    const summary = extractText(Array.isArray(data.summary) ? data.summary : [])
+    const summaryTokens = countTokens(summary)
     ledger.push({
       blockId: data.compactionId,
-      summary: extractText(Array.isArray(data.summary) ? data.summary : []),
+      summary,
+      summaryTokens,
+      estimatedNetTokens: shadowedTokenCount - summaryTokens,
       shadowedSeqs,
       shadowedTokenCount,
       start: data.shadowedRange?.start ?? 0,
