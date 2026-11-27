@@ -8,6 +8,7 @@ jobs:
   verify:
     runs-on: ubuntu-latest
     strategy:
+      fail-fast: false
       matrix:
         node: [22, 24]
     steps:
@@ -21,3 +22,29 @@ jobs:
       - run: npm test
       - run: npm run build
       - run: npm pack --dry-run
+  modern-dsh:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+      - name: Resolve published modern DSH dependencies
+        run: |
+          npm view @deepseek-ai/dsh-compaction dist-tags --json
+          node --input-type=module <<'JS'
+          import fs from 'node:fs'
+          const p = JSON.parse(fs.readFileSync('package.json', 'utf8'))
+          for (const section of ['peerDependencies', 'devDependencies']) {
+            for (const name of Object.keys(p[section])) {
+              if (name.startsWith('@deepseek-ai/dsh-')) p[section][name] = '0.2.3-alpha.2'
+            }
+            p[section]['@deepseek-ai/dsh-commands'] = '0.2.3-alpha.2'
+          }
+          fs.writeFileSync('package.json', JSON.stringify(p, null, 2))
+          JS
+          npm install --package-lock-only --ignore-scripts
+          npm ci
+      - run: npm run typecheck
+      - run: npm test
+      - run: npm run build
