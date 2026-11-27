@@ -1,4 +1,4 @@
-import { SessionSeq } from '@deepseek-ai/dsh-session'
+import { SessionSeq, type EpochHeader } from '@deepseek-ai/dsh-session'
 /**
  * dsh-smart-compact — a custom CompactionEngine backend with configurable
  * threshold prompting, a mandatory auto-compaction fallback, DCP-inspired
@@ -35,7 +35,7 @@ import {
 import type {} from '@deepseek-ai/dsh-agent'
 import type { Context } from '@deepseek-ai/cordis'
 import type { CommandId } from '@deepseek-ai/dsh-commands/types'
-import { CONTEXT_WINDOW_EXCEEDED_CODE, createUserMessage, type ContentBlock } from '@deepseek-ai/dsh-llm'
+import { CONTEXT_WINDOW_EXCEEDED_CODE, LlmError, createUserMessage, type ContentBlock } from '@deepseek-ai/dsh-llm'
 
 declare module '@deepseek-ai/dsh-llm' {
   interface MessageSourceMap {
@@ -79,7 +79,6 @@ const SYSTEM_PROMPT_SECTION = `## Context management (dsh-smart-compact)
 export class SmartCompactEngine extends CompactionEngine {
   readonly config: SmartCompactConfig
   private readonly engineCtx: Context
-  private readonly windowCache = new Map<string, number>()
   /** Runtime-only cadence guard so the mandatory fallback acts once per turn. */
   private readonly lastAutoCompactTurn = new Map<string, number>()
   /** Runtime-only cadence guard so the threshold nudge appears once per turn. */
@@ -174,6 +173,31 @@ export class SmartCompactEngine extends CompactionEngine {
         return { ...decision, messages: [...decision.messages, message] }
     })
 
+    // Wrap routing so that the final proposed model is priced before it is committed.
+    ctx.on('agent/request', async ({ agent, signal }, next) => {
+      const config = await next()
+      const previous = agent.session.requestHeader()
+      if (signal.aborted || previous === undefined || !config.provider || !config.model
+          || (previous.config.provider === config.provider && previous.config.model === config.model)) return config
+      const header = { ...previous, config }
+      try {
+        for (let attempt = 0; attempt < 3; attempt++) {
+          signal.throwIfAborted()
+          if (await this.measureRatio(agent, header, true, signal) < this.config.mandatoryRatio) return config
+          if (await this.autoCompactOldest(agent, signal) === null) break
+        }
+        signal.throwIfAborted()
+        if (await this.measureRatio(agent, header, true, signal) < this.config.mandatoryRatio) return config
+        throw new Error('no safe reduction below the target model pressure threshold')
+      } catch (error) {
+        signal.throwIfAborted()
+        throw new LlmError(
+          `Cannot switch to ${config.provider}/${config.model}: ${this.errorMessage(error)}`,
+          'MODEL_SWITCH_COMPACTION_FAILED', { cause: error },
+        )
+      }
+    }, { prepend: true })
+
     ctx.on('agent/status', ({ agent, status }) => {
       if (status === 'idle') this.overflowRetried.delete(agent.session)
     })
@@ -195,47 +219,53 @@ export class SmartCompactEngine extends CompactionEngine {
     })
   }
 
-  /** Effective context window for an agent (config wins; probe fallback 128000). */
+  /** Effective context window for the committed route (explicit config wins). */
   async windowFor(agent: SessionAgent): Promise<number> {
     if (this.config.modelContextLimit !== undefined) return this.config.modelContextLimit
-    const provider = agent.options.provider ?? ''
-    const model = agent.options.model ?? ''
-    const key = `${provider}\u0000${model}`
-    const cached = this.windowCache.get(key)
-    if (cached !== undefined) return cached
-    let window = DEFAULT_WINDOW
+    const route = agent.session.requestHeader()?.config ?? agent.options
     try {
-      const llm = this.engineCtx.get('llm')
-      const info = await llm?.resolveModelInfo?.(provider, model) as { context?: { contextWindow?: number } } | undefined
-      const context = info?.context?.contextWindow
-      if (typeof context === 'number' && context > 0) window = context
+      const info = await this.engineCtx.get('llm')?.resolveModelInfo?.(route.provider ?? '', route.model ?? '')
+      return info?.context?.contextWindow ?? DEFAULT_WINDOW
     } catch {
-      window = DEFAULT_WINDOW
+      return DEFAULT_WINDOW
     }
-    this.windowCache.set(key, window)
-    return window
   }
 
-  /** Price the committed route when available; older hosts fall back to agent options. */
-  async measureRatio(agent: SessionAgent): Promise<number> {
+  /** Price the actual or proposed durable request envelope, including completion reservation. */
+  async measureRatio(
+    agent: SessionAgent,
+    header = agent.session.requestHeader(),
+    strict = false,
+    signal?: AbortSignal,
+  ): Promise<number> {
     const meter = this.engineCtx.get('tokenMeter')
-    if (meter === undefined) return 0
-    const session = agent.session as SessionAgent['session'] & {
-      requestHeader?: () => { config: { provider?: string; model?: string; maxTokens?: number } } | undefined
+    if (meter === undefined) {
+      if (strict) throw new Error('token meter unavailable')
+      return 0
     }
-    const header = session.requestHeader?.()
     const route = header?.config ?? agent.options
-    const provider = route.provider ?? ''
-    const model = route.model ?? ''
-    const info = await this.engineCtx.get('llm')?.resolveModelInfo?.(provider, model) as {
-      context?: { contextWindow?: number }; defaultMaxTokens?: number
-    } | undefined
-    const window = this.config.modelContextLimit ?? info?.context?.contextWindow ?? DEFAULT_WINDOW
+    const info = await this.engineCtx.get('llm')?.resolveModelInfo?.(route.provider ?? '', route.model ?? '', signal)
+    const capacity = this.config.modelContextLimit ?? info?.context?.contextWindow
+    if (strict && capacity === undefined) throw new Error('target model context window unknown')
+    const window = capacity ?? DEFAULT_WINDOW
     const reserved = header?.config.maxTokens ?? info?.defaultMaxTokens ?? 0
-    const measurement = meter.measure(agent.session) as { surfaceTokens: number; totalTokens?: number }
-    const input = measurement.totalTokens ?? measurement.surfaceTokens
-    const budget = Math.max(1, window - reserved - this.config.headroomTokens)
-    return input / budget
+    const budget = window - reserved - this.config.headroomTokens
+    if (strict && budget <= 0) throw new Error('target model output reservation leaves no input capacity')
+    const measurement = meter.measure(agent.session, header)
+    return measurement.totalTokens / Math.max(1, budget)
+  }
+
+  /** Prefer the last route that actually answered: a newly selected target may be too small. */
+  private summaryRoute(agent: SessionAgent): { provider: string; model: string } {
+    const events = agent.session.snapshotEvents()
+    for (let i = events.length - 1; i >= 0; i--) {
+      const event = events[i]
+      if (event?.type !== 'assistant/message') continue
+      const { provider, model } = event.data.message.source
+      if (provider && model) return { provider, model }
+    }
+    const route = agent.session.requestHeader()?.config ?? agent.options
+    return { provider: route.provider ?? '', model: route.model ?? '' }
   }
 
   private llmOf(): LlmLike {
@@ -245,12 +275,11 @@ export class SmartCompactEngine extends CompactionEngine {
   }
 
   /** Engine-written summary of one span using the configurable prompt. */
-  private async engineSummarizeRange(agent: SessionAgent, start: number, end: number, signal?: AbortSignal): Promise<string> {
+  private async engineSummarizeRange(agent: SessionAgent, start: number, end: number, route: { provider: string; model: string }, signal?: AbortSignal): Promise<string> {
     return summarizeRange(this.llmOf(), agent.session, start, end, {
       prompt: this.config.summaryPrompt ?? DEFAULT_SUMMARY_PROMPT,
       maxTokens: this.config.summarizationMaxTokens,
-      provider: agent.options.provider ?? '',
-      model: agent.options.model ?? '',
+      ...route,
       signal,
     })
   }
@@ -312,13 +341,12 @@ export class SmartCompactEngine extends CompactionEngine {
       const event = session.snapshotEvents()[seq]
       if (event !== undefined) tokens += countTokens(extractEventText(event))
     }
-    const provider = agent.options.provider ?? ''
-    const model = agent.options.model ?? ''
+    const { provider, model } = this.summaryRoute(agent)
     const sourceCommandId = opts.sourceCommandId
     const bracket = beginCompaction(session, sourceCommandId)
     let summaryText: string
     try {
-      summaryText = await this.engineSummarizeRange(agent, s, e, effectiveSignal)
+      summaryText = await this.engineSummarizeRange(agent, s, e, { provider, model }, effectiveSignal)
     } catch (error) {
       const message = this.errorMessage(error)
       abortCompaction(session, bracket, message)
@@ -327,7 +355,12 @@ export class SmartCompactEngine extends CompactionEngine {
       throw this.manualError('summary', `summarization failed: ${message}`, error)
     }
     // Changed-span guard: the selected span must still be on the surface.
-    if (effectiveSignal.aborted || shadowedSeqsOf(session, s, e).join(',') !== shadowed.join(',')) {
+    if (effectiveSignal.aborted) {
+      abortCompaction(session, bracket, 'compaction cancelled')
+      if (opts.manual) throw this.manualError('cancelled', 'compaction cancelled')
+      effectiveSignal.throwIfAborted()
+    }
+    if (shadowedSeqsOf(session, s, e).join(',') !== shadowed.join(',')) {
       abortCompaction(session, bracket, 'span changed during summarization')
       if (!opts.manual) throw new Error('dsh-smart-compact: span changed during summarization')
       throw this.manualError('changed', 'span changed during summarization')
