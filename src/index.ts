@@ -54,6 +54,7 @@ import {
   isCheckpointNode,
   rebuildBlockLedger,
   resolveSurfaceRange,
+  requireExactSurfaceRange,
   runCompactionTransaction,
   shadowedSeqsOf,
 } from './region.ts'
@@ -80,9 +81,9 @@ export class SmartCompactEngine extends CompactionEngine {
   readonly config: SmartCompactConfig
   private readonly engineCtx: Context
   /** Runtime-only cadence guard so the mandatory fallback acts once per turn. */
-  private readonly lastAutoCompactTurn = new Map<string, number>()
+  private readonly lastAutoCompactTurn = new WeakMap<SessionAgent['session'], number>()
   /** Runtime-only cadence guard so the threshold nudge appears once per turn. */
-  private readonly lastNudgeTurn = new Map<string, number>()
+  private readonly lastNudgeTurn = new WeakMap<SessionAgent['session'], number>()
   private readonly overflowRetried = new WeakSet<SessionAgent['session']>()
 
   private rangeOpts(): { preserveRecent: number; protectedToolNames: readonly string[]; protectUserMessages: boolean } {
@@ -150,8 +151,8 @@ export class SmartCompactEngine extends CompactionEngine {
         // Nudge once per turn: repeated pre-steps of a multi-step turn must
         // not re-inject the advisory message.
         const turn = latestTurn(session)
-        if (this.lastNudgeTurn.get(session.id) === turn) return decision
-        this.lastNudgeTurn.set(session.id, turn)
+        if (this.lastNudgeTurn.get(session) === turn) return decision
+        this.lastNudgeTurn.set(session, turn)
         const ranges = buildCompressibleSeqRanges(session, this.rangeOpts())
         const suggestions = [
           ...(this.config.dedupEnabled ? dedupSuggestions(session) : []),
@@ -329,7 +330,7 @@ export class SmartCompactEngine extends CompactionEngine {
     let s: number
     let e: number
     try {
-      ({ start: s, end: e } = resolveSurfaceRange(session, start, end))
+      ({ start: s, end: e } = requireExactSurfaceRange(session, start, end))
     } catch (error) {
       if (opts.manual) throw this.manualError('changed', this.errorMessage(error), error)
       throw error
@@ -343,7 +344,13 @@ export class SmartCompactEngine extends CompactionEngine {
     }
     const { provider, model } = this.summaryRoute(agent)
     const sourceCommandId = opts.sourceCommandId
-    const bracket = beginCompaction(session, sourceCommandId)
+    let bracket: ReturnType<typeof beginCompaction>
+    try {
+      bracket = beginCompaction(session, sourceCommandId)
+    } catch (error) {
+      if (opts.manual) throw this.manualError('busy', this.errorMessage(error), error)
+      throw error
+    }
     let summaryText: string
     try {
       summaryText = await this.engineSummarizeRange(agent, s, e, { provider, model }, effectiveSignal)
@@ -360,7 +367,15 @@ export class SmartCompactEngine extends CompactionEngine {
       if (opts.manual) throw this.manualError('cancelled', 'compaction cancelled')
       effectiveSignal.throwIfAborted()
     }
-    if (shadowedSeqsOf(session, s, e).join(',') !== shadowed.join(',')) {
+    let unchanged = false
+    try {
+      requireExactSurfaceRange(session, s, e)
+      this.enforceProtection(session, s, e)
+      unchanged = shadowedSeqsOf(session, s, e).join(',') === shadowed.join(',')
+    } catch {
+      // A changed pairing or newly protected node invalidates the old selection.
+    }
+    if (!unchanged) {
       abortCompaction(session, bracket, 'span changed during summarization')
       if (!opts.manual) throw new Error('dsh-smart-compact: span changed during summarization')
       throw this.manualError('changed', 'span changed during summarization')
@@ -412,7 +427,7 @@ export class SmartCompactEngine extends CompactionEngine {
   /** Durable replace of one balanced span with an ALREADY-written summary (the compress-tool path). */
   private landWrittenRange(agent: SessionAgent, start: number, end: number, summaryText: string, sourceCommandId?: CommandId): CompactionResult {
     const session = agent.session
-    const { start: s, end: e } = resolveSurfaceRange(session, start, end)
+    const { start: s, end: e } = requireExactSurfaceRange(session, start, end)
     this.enforceProtection(session, s, e)
     const shadowed = shadowedSeqsOf(session, s, e)
     let tokens = 0
@@ -485,9 +500,10 @@ export class SmartCompactEngine extends CompactionEngine {
     }
     if (ratio < this.config.mandatoryRatio) return null
     const turn = latestTurn(agent.session)
-    if (this.lastAutoCompactTurn.get(agent.session.id) === turn) return null
-    this.lastAutoCompactTurn.set(agent.session.id, turn)
-    return this.autoCompactOldest(agent, signal)
+    if (this.lastAutoCompactTurn.get(agent.session) === turn) return null
+    const result = await this.autoCompactOldest(agent, signal)
+    if (result !== null) this.lastAutoCompactTurn.set(agent.session, turn)
+    return result
   }
 
   /** `/compact`: engine-driven LLM summary of the largest compressible span (original behavior). */

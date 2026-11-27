@@ -38,7 +38,20 @@ always sees a consistent picture.
 
 ## Upstream compatibility
 
-This release targets DSH `0.2.3-alpha.2` and Node.js 24+. The exact published DSH packages are pinned in the manifest and lockfile. CI installs the checked-in dependency graph, type-checks, tests, builds, and checks the package contents. Compatibility with later releases, the plugin marketplace, and real-provider end-to-end sessions is not yet established. The mount example below describes manual composition. See the [upstream compaction reference](https://github.com/deepseek-ai/deepseek-harness/tree/master/packages/compaction/compaction-basic).
+This release targets DSH `0.2.3-alpha.2` and Node.js 24+. The exact published DSH packages are pinned in the manifest and lockfile. CI installs the checked-in dependency graph, type-checks, tests, builds, and checks the package contents. Compatibility with later releases and real-provider end-to-end sessions is not yet established. The npm bundle targets base-backed profiles; the manual mount example below is an alternative. See the [upstream compaction reference](https://github.com/deepseek-ai/deepseek-harness/tree/master/packages/compaction/compaction-basic).
+
+## Install (TUI / CLI profiles)
+
+Once the npm version is published, install into the **same profile as your existing TUI**:
+
+```bash
+dsh plugin --profile tui add dsh-smart-compact@0.2.1
+dsh --profile tui
+```
+
+If your TUI uses a different profile name (for example `dsh-tui` or `pi-tui`), substitute it in both commands. The package declares a DSH bundle that disables the base `compaction-basic` row and mounts `compaction-smart`; it does not install a terminal frontend. `/compact` continues to use the active compaction backend. Set options by overriding the `compaction-smart` row in that profile's `cordis.patch.yml`.
+
+To uninstall, run `dsh plugin --profile tui remove dsh-smart-compact` and restart the profile. Do not manually mount a second backend in the same scope. This bundle targets base-backed profiles running DSH 0.2.3-alpha.2; independently isolated backends (such as some Web presets) need separate overrides.
 
 ## Mount
 

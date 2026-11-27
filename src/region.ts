@@ -71,6 +71,7 @@ export interface OpenBracket {
   readonly compactionId: CompactionId
   readonly startSeq: SessionSeq
   readonly turn: number | null
+  readonly sourceCommandId?: CommandId
 }
 
 /** Append `compaction/start` — the durable lock — BEFORE any summarization work. */
@@ -78,14 +79,21 @@ export function beginCompaction(
   session: Session,
   sourceCommandId?: CommandId,
 ): OpenBracket {
-  const turn = findOpenTurn(session.snapshotEvents())
+  const events = session.snapshotEvents()
+  const active = new Set<string>()
+  for (const event of events) {
+    if (event.type === 'compaction/start') active.add(event.data.compactionId)
+    if (event.type === 'compaction/end') active.delete(event.data.compactionId)
+  }
+  if (active.size > 0) throw new Error('dsh-smart-compact: another compaction is active')
+  const turn = findOpenTurn(events)
   const compactionId = CompactionId(randomUUID())
   const event = session.append('compaction/start', {
     compactionId,
     turn,
     ...(sourceCommandId === undefined ? {} : { sourceCommandId }),
   })
-  return { compactionId, startSeq: event.seq, turn }
+  return { compactionId, startSeq: event.seq, turn, sourceCommandId }
 }
 
 /** Complete an open bracket: summary + replace + end. Returns all 4 seqs. */
@@ -131,7 +139,8 @@ export function abortCompaction(session: Session, bracket: OpenBracket, error?: 
   session.append('compaction/end', {
     compactionId: bracket.compactionId,
     turn: bracket.turn,
-    error,
+    ...(bracket.sourceCommandId === undefined ? {} : { sourceCommandId: bracket.sourceCommandId }),
+    ...(error === undefined ? {} : { error }),
   })
 }
 
@@ -141,7 +150,12 @@ export function runCompactionTransaction(
   input: CompactionTransactionInput,
 ): { compactionId: CompactionId; seqs: SessionSeq[] } {
   const bracket = beginCompaction(session, input.sourceCommandId)
-  return completeCompaction(session, bracket, input)
+  try {
+    return completeCompaction(session, bracket, input)
+  } catch (error) {
+    abortCompaction(session, bracket, error instanceof Error ? error.message : String(error))
+    throw error
+  }
 }
 
 /** Whether a surface user message is a compaction checkpoint node. */
@@ -153,6 +167,15 @@ export function isCheckpointNode(event: SessionEvent): boolean {
 
 /** Rebuild the block ledger from the log (authoritative, kernel-free). */
 export function rebuildBlockLedger(events: readonly SessionEvent[]): BlockLedgerEntry[] {
+  // A summary append alone is not a surface replacement. Count only landed checkpoints.
+  const landed = new Set<string>()
+  for (const event of events) {
+    if (event.type !== 'user/message') continue
+    const source = event.data.source as { kind?: string; plugin?: string; compactionId?: string }
+    if ((source.kind === 'compact-checkpoint' || source.plugin === 'compact') && source.compactionId) {
+      landed.add(source.compactionId)
+    }
+  }
   const ledger: BlockLedgerEntry[] = []
   for (const event of events) {
     if (event.type !== 'compaction/summary') continue
@@ -163,7 +186,7 @@ export function rebuildBlockLedger(events: readonly SessionEvent[]): BlockLedger
       shadowedSeqs?: number[]
       shadowedTokenCount?: number
     }
-    if (typeof data.compactionId !== 'string') continue
+    if (typeof data.compactionId !== 'string' || !landed.has(data.compactionId)) continue
     let shadowedTokenCount = data.shadowedTokenCount ?? 0
     const shadowedSeqs = Array.isArray(data.shadowedSeqs) ? data.shadowedSeqs : []
     // Backfill 0/legacy counts from the shadowed originals still in the log.
@@ -254,6 +277,17 @@ export function resolveSurfaceRange(session: Session, start: number, end: number
   throw new Error(`dsh-smart-compact: no tool-pairing-balanced range around ${start}..${end} — narrow the range`)
 }
 
+/** Validate an exact live span; never reinterpret stale model-written summary boundaries. */
+export function requireExactSurfaceRange(session: Session, start: number, end: number): { start: number; end: number } {
+  if (!Number.isSafeInteger(start) || !Number.isSafeInteger(end)) throw new Error('dsh-smart-compact: invalid seq')
+  const selected = shadowedSeqsOf(session, start, end)
+  if (selected.length === 0) throw new Error('dsh-smart-compact: missing or reversed surface range; refresh dcp_status')
+  if (!toolPairingBalancedBefore(session, SessionSeq(start)) || !toolPairingBalancedAfter(session, SessionSeq(end))) {
+    throw new Error('dsh-smart-compact: unbalanced range; refresh dcp_status')
+  }
+  return { start, end }
+}
+
 /**
  * Compressible spans computed directly from the surface: skips the protected
  * recent tail, the last user message, compaction checkpoints, protected tool
@@ -272,6 +306,7 @@ export function buildCompressibleSeqRanges(
 ): SeqCompressibleRange[] {
   const nodes = session.surface.nodes
   const protectedSeqs = protectedSurfaceSeqs(session, opts)
+  const events = session.snapshotEvents()
   const protectUserMessages = opts.protectUserMessages === true
   const raw: SeqCompressibleRange[] = []
   let cur: SeqCompressibleRange | null = null
@@ -280,7 +315,7 @@ export function buildCompressibleSeqRanges(
     cur = null
   }
   for (const seq of nodes) {
-    const event = session.snapshotEvents()[seq]
+    const event = events[seq]
     const isUser = event?.type === 'user/message' && !isCheckpointNode(event)
     if (event === undefined || protectedSeqs.has(seq) || isCheckpointNode(event) || (protectUserMessages && isUser)) {
       flush()
@@ -301,7 +336,7 @@ export function buildCompressibleSeqRanges(
       const selected = shadowedSeqsOf(session, start, end)
       const original = new Set(shadowedSeqsOf(session, range.start, range.end))
       if (selected.some(seq => !original.has(seq))) continue
-      const tokens = selected.reduce((sum, seq) => sum + countTokens(extractEventText(session.snapshotEvents()[seq]!)), 0)
+      const tokens = selected.reduce((sum, seq) => sum + countTokens(extractEventText(events[seq]!)), 0)
       out.push({ start, end, count: selected.length, tokens })
     } catch {
       // Cannot be balanced into a compressible span — skip.
@@ -313,14 +348,15 @@ export function buildCompressibleSeqRanges(
 /** Shared retention rules for automatic and model-directed compression. */
 export function protectedSurfaceSeqs(session: Session, opts: { preserveRecent?: number; protectedToolNames?: readonly string[]; protectUserMessages?: boolean } = {}): Set<number> {
   const nodes = session.surface.nodes
+  const events = session.snapshotEvents()
   const preserve = opts.preserveRecent ?? 5
   const protectedToolNames = new Set(opts.protectedToolNames ?? [])
   const protectUserMessages = opts.protectUserMessages === true
   const protectedSeqs = new Set<number>()
   for (const seq of preserve > 0 ? nodes.slice(-preserve) : []) protectedSeqs.add(seq)
   for (let index = nodes.length - 1; index >= 0; index -= 1) {
-    const event = session.snapshotEvents()[nodes[index]!]
-    if (event?.type === 'user/message' && !isCheckpointNode(event)) {
+    const event = events[nodes[index]!]
+    if (event?.type === 'user/message' && !isCheckpointNode(event) && event.data.source.kind !== 'smart-compact-nudge') {
       protectedSeqs.add(nodes[index]!)
       break
     }
@@ -329,7 +365,7 @@ export function protectedSurfaceSeqs(session: Session, opts: { preserveRecent?: 
   if (protectedToolNames.size > 0) {
     const callIds = new Set<string>()
     for (const seq of nodes) {
-      const event = session.snapshotEvents()[seq]
+      const event = events[seq]
       if (event?.type !== 'assistant/message') continue
       const content = (event.data as { message?: { content?: ReadonlyArray<{ type?: string; name?: string; id?: string }> } })
         .message?.content
@@ -342,7 +378,7 @@ export function protectedSurfaceSeqs(session: Session, opts: { preserveRecent?: 
     }
     if (callIds.size > 0) {
       for (const seq of nodes) {
-        const event = session.snapshotEvents()[seq]
+        const event = events[seq]
         if (event?.type !== 'tool/result') continue
         const message = (event.data as { message?: { callId?: string; source?: { callId?: string } } }).message
         const callId = message?.callId ?? message?.source?.callId
@@ -351,8 +387,8 @@ export function protectedSurfaceSeqs(session: Session, opts: { preserveRecent?: 
     }
   }
   for (const seq of nodes) {
-    const event = session.snapshotEvents()[seq]
-    if (event === undefined || isCheckpointNode(event) || (protectUserMessages && event.type === 'user/message')) protectedSeqs.add(seq)
+    const event = events[seq]
+    if (event === undefined || event.type === 'system/message' || isCheckpointNode(event) || (protectUserMessages && event.type === 'user/message')) protectedSeqs.add(seq)
   }
   return protectedSeqs
 }

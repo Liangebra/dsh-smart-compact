@@ -1,0 +1,11 @@
+# Replace the base profile compaction backend without replacing the TUI itself.
+- id: compaction-basic
+  disabled: true
+- insert:
+    - id: compaction-smart
+      name: dsh-smart-compact
+      inject: [llm, tokenMeter, tools, systemPrompt]
+      config:
+        thresholdRatio: 0.5
+        mandatoryRatio: 0.9
+        headroomTokens: 4096

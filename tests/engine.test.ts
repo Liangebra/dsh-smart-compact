@@ -2,9 +2,9 @@ import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import { Context } from '@deepseek-ai/cordis'
 import { ManualCompactionError } from '@deepseek-ai/dsh-compaction'
-import { CONTEXT_WINDOW_EXCEEDED_CODE } from '@deepseek-ai/dsh-llm'
+import { CONTEXT_WINDOW_EXCEEDED_CODE, createUserMessage, createSystemMessage } from '@deepseek-ai/dsh-llm'
 import { SmartCompactEngine } from '../src/index.ts'
-import { buildCompressibleSeqRanges, rebuildBlockLedger } from '../src/region.ts'
+import { beginCompaction, abortCompaction, buildCompressibleSeqRanges, rebuildBlockLedger } from '../src/region.ts'
 import { buildTextSession, appendToolCall, appendToolResult } from './helpers.ts'
 
 function fakeLlm(text: string): { stream: () => AsyncIterable<unknown> } {
@@ -421,4 +421,72 @@ test('routing: rejects an unsafe switch when no safe span can be compressed', as
   await assert.rejects(ctx.waterfall('agent/request', payload as never,
     async () => ({ provider: 'test-provider', model: 'small' }) as never), /Cannot switch/)
   assert.equal(rebuildBlockLedger(session.snapshotEvents()).length, 0)
+})
+
+test('safety: stale model-written spans are rejected rather than snapped to unrelated messages', async () => {
+  const ctx = new Context()
+  const engine = engineWith(ctx, { preserveRecent: 0 })
+  const session = buildTextSession(10)
+  const nodes = session.surface.nodes
+  const start = nodes[0]!, end = nodes[1]!
+  await engine.modelCompressRange(agentOf(session), start, end, 'FIRST')
+  const surface = [...session.surface.nodes]
+  const size = session.snapshotEvents().length
+  await assert.rejects(engine.modelCompressRange(agentOf(session), start, end, 'STALE'), /surface range/)
+  assert.deepEqual(session.surface.nodes, surface)
+  assert.equal(session.snapshotEvents().length, size)
+})
+
+test('safety: the most recent actual user instruction is protected after a plugin nudge', async () => {
+  const ctx = new Context()
+  const engine = engineWith(ctx, { preserveRecent: 0 })
+  const session = buildTextSession(10)
+  const user = [...session.surface.nodes].reverse().find(seq => session.snapshotEvents()[seq]?.type === 'user/message')!
+  session.append('user/message', createUserMessage({ content: [{ type: 'text', text: 'nudge' }],
+    source: { kind: 'smart-compact-nudge' } }), { surfaceOp: 'append' })
+  await assert.rejects(engine.modelCompressRange(agentOf(session), user, user, 'SUMMARY'), /protected seq/)
+})
+
+test('safety: initial system instruction is excluded from automatic and explicit spans', async () => {
+  const ctx = new Context()
+  const engine = engineWith(ctx, { preserveRecent: 0 })
+  const session = buildTextSession(10)
+  const head = session.surface.nodes[0]!
+  const system = session.append('system/message', { turn: 1, step: 1, message: createSystemMessage('system instruction') },
+    { surfaceOp: { op: 'replace', startSeq: head, endSeq: head }, sourceEventSeqs: [head] }).seq
+  assert.ok(buildCompressibleSeqRanges(session, { preserveRecent: 0 }).every(r => r.start !== system))
+  await assert.rejects(engine.modelCompressRange(agentOf(session), system, system, 'SUMMARY'), /protected seq/)
+})
+
+test('safety: overlapping compaction attempts cannot open a second bracket', async () => {
+  const ctx = new Context()
+  const engine = engineWith(ctx, { preserveRecent: 0 })
+  const session = buildTextSession(10)
+  const range = buildCompressibleSeqRanges(session, { preserveRecent: 0 })[0]!
+  const bracket = beginCompaction(session)
+  try {
+    await assert.rejects(engine.modelCompressRange(agentOf(session), range.start, range.end, 'SUMMARY'), /active/)
+    assert.equal(session.snapshotEvents().filter(event => event.type === 'compaction/start').length, 1)
+  } finally {
+    abortCompaction(session, bracket)
+  }
+})
+
+test('safety: a failed checkpoint append does not leave a phantom ledger block or open lock', async () => {
+  const ctx = new Context()
+  const engine = engineWith(ctx, { preserveRecent: 0 })
+  const session = buildTextSession(10)
+  const range = buildCompressibleSeqRanges(session, { preserveRecent: 0 })[0]!
+  const surface = [...session.surface.nodes]
+  const append = session.append.bind(session) as (...args: unknown[]) => unknown
+  session.append = ((type: string, data: unknown, opts?: unknown) => {
+    if (type === 'user/message') throw new Error('injected checkpoint failure')
+    return append(type, data, opts)
+  }) as unknown as typeof session.append
+  await assert.rejects(engine.modelCompressRange(agentOf(session), range.start, range.end, 'SUMMARY'), /checkpoint failure/)
+  assert.deepEqual(session.surface.nodes, surface)
+  assert.equal(rebuildBlockLedger(session.snapshotEvents()).length, 0)
+  assert.equal(session.snapshotEvents().filter(event => event.type === 'compaction/end').length, 1)
+  const bracket = beginCompaction(session)
+  abortCompaction(session, bracket)
 })

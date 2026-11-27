@@ -1,6 +1,6 @@
 {
   "name": "dsh-smart-compact",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "description": "Custom DSH CompactionEngine backend: configurable threshold prompting, mandatory fallback at the limit, DCP-inspired dedup/purge, custom summary prompt, and /compact like the original. Zero external state — everything is rebuilt from the append-only session log.",
   "license": "MIT",
   "type": "module",
@@ -10,13 +10,16 @@
     ".": {
       "types": "./dist/index.d.ts",
       "import": "./dist/index.js"
-    }
+    },
+    "./package.json": "./package.json",
+    "./cordis.patch.yml": "./cordis.patch.yml"
   },
   "files": [
     "dist",
     "README.md",
     "LICENSE",
-    "README.zh.md"
+    "README.zh.md",
+    "cordis.patch.yml"
   ],
   "engines": {
     "node": ">=24"
@@ -51,5 +54,31 @@
     "tsx": "^4.19.0",
     "typescript": "^5.6.0",
     "@deepseek-ai/dsh-commands": "0.2.3-alpha.2"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Liangebra/dsh-smart-compact.git"
+  },
+  "homepage": "https://github.com/Liangebra/dsh-smart-compact#readme",
+  "bugs": {
+    "url": "https://github.com/Liangebra/dsh-smart-compact/issues"
+  },
+  "keywords": [
+    "dsh",
+    "dsh-plugin",
+    "deepseek-harness",
+    "context-compaction",
+    "context-pruning",
+    "tui",
+    "agent"
+  ],
+  "publishConfig": {
+    "access": "public",
+    "registry": "https://registry.npmjs.org/"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
   }
 }
