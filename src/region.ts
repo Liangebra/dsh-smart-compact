@@ -71,6 +71,7 @@ export interface OpenBracket {
   readonly compactionId: CompactionId
   readonly startSeq: SessionSeq
   readonly turn: number | null
+  readonly sourceCommandId?: CommandId
 }
 
 /** Append `compaction/start` — the durable lock — BEFORE any summarization work. */
@@ -92,7 +93,7 @@ export function beginCompaction(
     turn,
     ...(sourceCommandId === undefined ? {} : { sourceCommandId }),
   })
-  return { compactionId, startSeq: event.seq, turn }
+  return { compactionId, startSeq: event.seq, turn, sourceCommandId }
 }
 
 /** Complete an open bracket: summary + replace + end. Returns all 4 seqs. */
@@ -138,7 +139,8 @@ export function abortCompaction(session: Session, bracket: OpenBracket, error?: 
   session.append('compaction/end', {
     compactionId: bracket.compactionId,
     turn: bracket.turn,
-    error,
+    ...(bracket.sourceCommandId === undefined ? {} : { sourceCommandId: bracket.sourceCommandId }),
+    ...(error === undefined ? {} : { error }),
   })
 }
 
