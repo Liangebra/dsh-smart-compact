@@ -1,0 +1,38 @@
+name: Publish to npm
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths: [package.json]
+permissions:
+  contents: read
+  id-token: write
+concurrency:
+  group: npm-publish
+  cancel-in-progress: false
+jobs:
+  publish:
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          registry-url: https://registry.npmjs.org
+      - run: npm ci
+      - run: npm run typecheck
+      - run: npm test
+      - run: npm run build
+      - run: npm pack --dry-run
+      - name: Publish exact checked-in version
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: |
+          spec=$(node -p "require('./package.json').name + '@' + require('./package.json').version")
+          if npm view "$spec" version --registry=https://registry.npmjs.org >/dev/null 2>&1; then
+            echo "$spec already exists; refusing to overwrite."
+            exit 0
+          fi
+          npm publish --access public
+          npm view "$spec" version --registry=https://registry.npmjs.org
