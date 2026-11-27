@@ -36,27 +36,30 @@ export async function summarizeRange(
   const seqs = shadowedSeqsOf(session, start, end)
   const parts: string[] = []
   for (const seq of seqs) {
-    const event = session.events[seq]
+    const event = session.snapshotEvents()[seq]
     if (event === undefined) continue
     parts.push(`[${event.type} seq ${seq}]\n${extractEventText(event)}`)
   }
   const messages = [createUserMessage({
     content: [{ type: 'text', text: buildSummaryPrompt(options.prompt, parts.join('\n\n')) }],
-    source: { kind: 'plugin', plugin: 'dsh-smart-compact' },
+    source: { kind: 'user' },
   })]
   let text = ''
+  let current = ''
   for await (const chunk of llm.stream({
     provider: options.provider,
     model: options.model,
     messages,
     maxTokens: options.maxTokens,
     signal: options.signal,
-    purpose: 'compaction',
   })) {
-    if (chunk.type === 'text-delta') text += chunk.text
-    else if (chunk.type === 'block-end' && chunk.block.type === 'text') text += chunk.block.text
+    if (chunk.type === 'text-delta') current += chunk.text
+    else if (chunk.type === 'block-end' && chunk.block.type === 'text') {
+      text += chunk.block.text
+      current = ''
+    }
   }
-  const trimmed = text.trim()
+  const trimmed = (text + current).trim()
   if (trimmed.length === 0) throw new Error('dsh-smart-compact: summarization produced no text')
   return trimmed
 }

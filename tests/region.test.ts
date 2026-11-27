@@ -1,3 +1,4 @@
+import { SessionSeq } from '@deepseek-ai/dsh-session'
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import {
@@ -14,7 +15,7 @@ test('region: compressible ranges skip the protected tail and last user message'
   const ranges = buildCompressibleSeqRanges(session, { preserveRecent: 5 })
   assert.ok(ranges.length > 0)
   // The last user message is never compressible.
-  const lastUser = [...session.surface.nodes].reverse().find((seq) => session.events[seq]?.type === 'user/message')!
+  const lastUser = [...session.surface.nodes].reverse().find((seq) => session.snapshotEvents()[seq]?.type === 'user/message')!
   for (const range of ranges) assert.ok(!(range.start <= lastUser && lastUser <= range.end), 'last user message protected')
   // Ranges are sorted by reclaimed tokens, largest first.
   for (let index = 1; index < ranges.length; index += 1) {
@@ -40,14 +41,15 @@ test('region: transaction replaces the span and rebuilds a ledger block', () => 
   })
   assert.ok(compactionId.length > 0)
   assert.equal(seqs.length, 4)
-  const ledger = rebuildBlockLedger(session.events)
+  const ledger = rebuildBlockLedger(session.snapshotEvents())
   assert.equal(ledger.length, 1)
   assert.equal(ledger[0]!.summary, 'CHECKPOINT')
+  assert.equal(ledger[0]!.estimatedNetTokens, ledger[0]!.shadowedTokenCount - ledger[0]!.summaryTokens)
   assert.deepEqual(ledger[0]!.shadowedSeqs, shadowed)
   // Originals stay in the log; the surface no longer shows them.
   const onSurface = new Set(session.surface.nodes)
-  for (const seq of shadowed) assert.ok(!onSurface.has(seq), `seq ${seq} shadowed`)
-  for (const seq of shadowed) assert.ok(session.events[seq] !== undefined, `seq ${seq} original still logged`)
+  for (const seq of shadowed) assert.ok(!onSurface.has(SessionSeq(seq)), `seq ${seq} shadowed`)
+  for (const seq of shadowed) assert.ok(session.snapshotEvents()[seq] !== undefined, `seq ${seq} original still logged`)
 })
 
 test('region: checkpoints are never re-compressed; fresh content after them is', () => {
@@ -70,12 +72,12 @@ test('region: checkpoints are never re-compressed; fresh content after them is',
   appendUser(session, 'even more '.repeat(200))
   const ranges = buildCompressibleSeqRanges(session)
   assert.ok(ranges.length > 0)
-  assert.equal(rebuildBlockLedger(session.events).length, 1, 'checkpoint not folded')
+  assert.equal(rebuildBlockLedger(session.snapshotEvents()).length, 1, 'checkpoint not folded')
 })
 
 test('region: protectUserMessages keeps every user message uncompressed', () => {
   const session = buildTextSession(10)
-  const userSeqs = session.surface.nodes.filter((seq) => session.events[seq]?.type === 'user/message')
+  const userSeqs = session.surface.nodes.filter((seq) => session.snapshotEvents()[seq]?.type === 'user/message')
   const ranges = buildCompressibleSeqRanges(session, { protectUserMessages: true })
   for (const range of ranges) {
     for (const seq of userSeqs) {
@@ -87,14 +89,14 @@ test('region: protectUserMessages keeps every user message uncompressed', () => 
 test('region: protectedTools keeps the named tool call/result pair uncompressed', () => {
   const session = buildToolSession()
   const toolCallSeq = session.surface.nodes.find((seq) => {
-    const event = session.events[seq]
+    const event = session.snapshotEvents()[seq]
     if (event?.type !== 'assistant/message') return false
-    return (event.data as { message?: { content?: Array<{ type?: string; name?: string }> } })
+    return (event.data as { message?: { content?: ReadonlyArray<{ type?: string; name?: string }> } })
       .message?.content?.some((block) => block.type === 'tool-call' && block.name === 'bash') === true
   })!
   assert.ok(toolCallSeq !== undefined)
   // The paired result (same callId) must be protected together with the call.
-  const toolResultSeq = session.surface.nodes.find((seq) => session.events[seq]?.type === 'tool/result')!
+  const toolResultSeq = session.surface.nodes.find((seq) => session.snapshotEvents()[seq]?.type === 'tool/result')!
   assert.ok(toolResultSeq !== undefined)
   const ranges = buildCompressibleSeqRanges(session, { protectedToolNames: ['bash'] })
   for (const range of ranges) {
@@ -116,5 +118,10 @@ test('region: resolveSurfaceRange snaps stale edges to live nodes', () => {
   const session = buildTextSession(6)
   const nodes = session.surface.nodes
   const { start } = resolveSurfaceRange(session, nodes[0]!, nodes[nodes.length - 1]!)
-  assert.ok(nodes.includes(start))
+  assert.ok(nodes.includes(SessionSeq(start)))
+})
+
+ test('region: zero retained nodes does not protect the entire surface', () => {
+  const session = buildTextSession(10)
+  assert.ok(buildCompressibleSeqRanges(session, { preserveRecent: 0 }).length > 0)
 })

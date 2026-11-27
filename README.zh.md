@@ -27,7 +27,7 @@ compaction/start  →  compaction/summary  →  user/message（surface 替换）
 
 ## 上游兼容性
 
-本实现基于 DSH `0.1.0-rc.6` 开发。审查时上游源码已推进至 `0.2.3-alpha.2`，新增路由请求压力测算、输出预算预留、模型切换压缩及可选工具结果裁剪。尚未验证本插件与该版本的运行兼容性；下方挂载方式为原有手动组合方式，并非已经验证的插件市场安装流程。参见[官方压缩模块](https://github.com/deepseek-ai/deepseek-harness/tree/master/packages/compaction/compaction-basic)。
+本版本面向 DSH `0.2.3-alpha.2` 与 Node.js 24+，在依赖清单和 lockfile 中固定已发布的 DSH 版本。CI 使用仓库中的依赖锁执行安装、类型检查、测试、构建和打包检查。后续 DSH 版本、插件市场及真实模型端到端会话尚未验证；下方为手动组合挂载方式。参见[官方压缩模块](https://github.com/deepseek-ai/deepseek-harness/tree/master/packages/compaction/compaction-basic)。
 
 ## 挂载
 
@@ -58,11 +58,12 @@ compaction/start  →  compaction/summary  →  user/message（surface 替换）
 | 选项 | 默认 | 含义 |
 |---|---|---|
 | `thresholdRatio` | `0.5` | 上下文占用达到该比例时注入建议提示（`agent/pre-step`），由模型决定是否使用 `compress` 工具。 |
+| `headroomTokens` | `4096` | 除已路由模型的输出预留外，额外保留的输入空间。 |
 | `mandatoryRatio` | `0.9` | 达到/超过该比例时引擎自动压缩最大可压缩范围（每轮一次）。 |
-| `summarizationMaxTokens` | `8192` | 引擎直接调用 `ctx.llm.stream` 摘要（`purpose: 'compaction'`）的生成上限。 |
-| `preserveRecent` | `5` | 最近 N 个 surface 节点永不自动压缩。 |
+| `summarizationMaxTokens` | `8192` | 引擎直接调用 `ctx.llm.stream` 摘要的生成上限。 |
+| `preserveRecent` | `5` | 最近 N 个 surface 节点受压缩保护。 |
 | `dedupEnabled` | `true` | 在 `dcp_status` 中提供 DCP 风格去重建议。 |
-| `purgeErroredTurns` | `4` | 为最近 N 个报错轮次提供清理建议。 |
+| `purgeErroredTurns` | `4` | 为至少 N 轮之前的报错调用提供清理建议；0 禁用。 |
 | `protectedTools` | `[]` | 这些工具名的调用/结果对永不压缩。 |
 | `protectUserMessages` | `false` | 保留全部用户消息原文（永不压缩）。 |
 | `summaryPrompt` | 内置 | 完整提示词模板；`{content}` 替换为范围原文。 |
@@ -72,10 +73,11 @@ compaction/start  →  compaction/summary  →  user/message（surface 替换）
 
 ## 行为
 
-- **阈值提示**——surface 占用超过 `thresholdRatio` 后注入简短建议；系统提示段说明
+- **阈值提示**——估算总输入占用超过 `thresholdRatio` 后注入简短建议；系统提示段说明
   `compress` 工具（`range` / `message` 两种模式）并指向 `dcp_status`。
 - **强制自动压缩**——占用达到 `mandatoryRatio`（或供应商确认 `context-overflow`）时，
-  引擎用自写摘要自动压缩最大可压缩范围。这是**硬性安全网**，每轮只触发一次。
+  引擎用自写摘要自动压缩最大可压缩范围。这是**硬性安全网**，普通压力每轮触发一次；溢出恢复仅在产生持久化替换后重试，在下一次成功响应或空闲前最多一次。
+- **模型切换**——按候选路由和输出预留估算压力，最多尝试三次安全压缩；不能降至强制阈值以下则拒绝切换。摘要优先使用最后实际成功响应的模型。
 - **`/compact`**——引擎驱动的 LLM 摘要，压缩最大可压缩范围；通过 `runMaintenance`
   与驱动轮次串行化；失败按 `ManualCompactionError` 分类抛出
   （`busy` / `cancelled` / `changed` / `summary` / `commit`）。
@@ -88,7 +90,7 @@ compaction/start  →  compaction/summary  →  user/message（surface 替换）
 ## 开发
 
 ```bash
-npm install
+npm ci
 npm run typecheck
 npm test        # node --import tsx --test tests/*.test.ts
 npm run build

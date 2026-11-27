@@ -1,0 +1,36 @@
+name: CI
+on:
+  push:
+  pull_request:
+permissions:
+  contents: read
+jobs:
+  modern-dsh:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+      - run: npm ci
+      - run: npm run typecheck
+      - run: npm test
+      - run: npm run build
+      - name: Mount the built package through Cordis
+        run: |
+          node --input-type=module <<'JS'
+          import assert from 'node:assert/strict'
+          import { Context } from '@deepseek-ai/cordis'
+          import { CompactionEngine } from '@deepseek-ai/dsh-compaction'
+          import SmartCompactEngine from 'dsh-smart-compact'
+          const ctx = new Context()
+          try {
+            await ctx.plugin(SmartCompactEngine, { autoTools: false, autoNudge: false, thresholdRatio: 0.6 })
+            const engine = ctx.get('compaction')
+            assert.ok(engine instanceof CompactionEngine)
+            assert.equal(engine.config.thresholdRatio, 0.6)
+          } finally {
+            await ctx.fiber.dispose()
+          }
+          JS
+      - run: npm pack --dry-run

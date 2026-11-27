@@ -1,3 +1,4 @@
+import { SessionSeq, type EpochHeader } from '@deepseek-ai/dsh-session'
 /**
  * dsh-smart-compact — a custom CompactionEngine backend with configurable
  * threshold prompting, a mandatory auto-compaction fallback, DCP-inspired
@@ -31,10 +32,16 @@ import {
   type CompactionTrigger,
   type ManualCompactAgentContext,
 } from '@deepseek-ai/dsh-compaction'
-import type { Agent } from '@deepseek-ai/dsh-agent'
+import type {} from '@deepseek-ai/dsh-agent'
 import type { Context } from '@deepseek-ai/cordis'
-import type { CommandId } from '@deepseek-ai/dsh-commands/brand'
-import { createUserMessage, type ContentBlock } from '@deepseek-ai/dsh-llm'
+import type { CommandId } from '@deepseek-ai/dsh-commands/types'
+import { CONTEXT_WINDOW_EXCEEDED_CODE, LlmError, createUserMessage, type ContentBlock } from '@deepseek-ai/dsh-llm'
+
+declare module '@deepseek-ai/dsh-llm' {
+  interface MessageSourceMap {
+    'smart-compact-nudge': { kind: 'smart-compact-nudge' }
+  }
+}
 import { resolveConfig, type SmartCompactConfig } from './config.ts'
 import { DEFAULT_SUMMARY_PROMPT, buildSummaryPrompt } from './prompt.ts'
 import { summarizeRange, type LlmLike } from './summarize.ts'
@@ -43,6 +50,7 @@ import {
   beginCompaction,
   buildCompressibleSeqRanges,
   completeCompaction,
+  protectedSurfaceSeqs,
   isCheckpointNode,
   rebuildBlockLedger,
   resolveSurfaceRange,
@@ -71,11 +79,11 @@ const SYSTEM_PROMPT_SECTION = `## Context management (dsh-smart-compact)
 export class SmartCompactEngine extends CompactionEngine {
   readonly config: SmartCompactConfig
   private readonly engineCtx: Context
-  private readonly windowCache = new Map<string, number>()
   /** Runtime-only cadence guard so the mandatory fallback acts once per turn. */
   private readonly lastAutoCompactTurn = new Map<string, number>()
   /** Runtime-only cadence guard so the threshold nudge appears once per turn. */
   private readonly lastNudgeTurn = new Map<string, number>()
+  private readonly overflowRetried = new WeakSet<SessionAgent['session']>()
 
   private rangeOpts(): { preserveRecent: number; protectedToolNames: readonly string[]; protectUserMessages: boolean } {
     return {
@@ -121,10 +129,16 @@ export class SmartCompactEngine extends CompactionEngine {
       systemPrompt.section({ name: 'dsh-smart-compact', order: 200, text: SYSTEM_PROMPT_SECTION })
     }
 
-    if (this.config.autoNudge) {
-      ctx.on('agent/pre-step', async (payload: { agent: Agent; turn: number }, next) => {
+    ctx.on('agent/pre-step', async (payload, next) => {
+        if (!payload.signal.aborted) {
+          try {
+            await this.compactIfNeeded(payload.agent, 'pressure', payload.signal)
+          } catch {
+            // Pressure recovery is best-effort; keep the original step available.
+          }
+        }
         const decision = await next()
-        if (decision.kind === 'reject') return decision
+        if (!this.config.autoNudge || payload.signal.aborted || decision.kind === 'reject') return decision
         let ratio = 0
         try {
           ratio = await this.measureRatio(payload.agent)
@@ -154,41 +168,104 @@ export class SmartCompactEngine extends CompactionEngine {
               suggestions,
             }),
           }],
-          source: { kind: 'plugin', plugin: 'dsh-smart-compact' },
+          source: { kind: 'smart-compact-nudge' },
         })
-        return { kind: 'enter', messages: [...decision.messages, message] }
-      })
-    }
+        return { ...decision, messages: [...decision.messages, message] }
+    })
+
+    // Wrap routing so that the final proposed model is priced before it is committed.
+    ctx.on('agent/request', async ({ agent, signal }, next) => {
+      const config = await next()
+      const previous = agent.session.requestHeader()
+      if (signal.aborted || previous === undefined || !config.provider || !config.model
+          || (previous.config.provider === config.provider && previous.config.model === config.model)) return config
+      const header = { ...previous, config }
+      try {
+        for (let attempt = 0; attempt < 3; attempt++) {
+          signal.throwIfAborted()
+          if (await this.measureRatio(agent, header, true, signal) < this.config.mandatoryRatio) return config
+          if (await this.autoCompactOldest(agent, signal) === null) break
+        }
+        signal.throwIfAborted()
+        if (await this.measureRatio(agent, header, true, signal) < this.config.mandatoryRatio) return config
+        throw new Error('no safe reduction below the target model pressure threshold')
+      } catch (error) {
+        signal.throwIfAborted()
+        throw new LlmError(
+          `Cannot switch to ${config.provider}/${config.model}: ${this.errorMessage(error)}`,
+          'MODEL_SWITCH_COMPACTION_FAILED', { cause: error },
+        )
+      }
+    }, { prepend: true })
+
+    ctx.on('agent/status', ({ agent, status }) => {
+      if (status === 'idle') this.overflowRetried.delete(agent.session)
+    })
+    ctx.on('session/event', (session, event) => {
+      if (event.type === 'assistant/message') this.overflowRetried.delete(session)
+    })
+    ctx.on('agent/request-error', async ({ agent, failure, signal }, next) => {
+      if (failure.code !== CONTEXT_WINDOW_EXCEEDED_CODE || signal.aborted
+          || this.overflowRetried.has(agent.session)) return next()
+      const generation = agent.session.surface.replaceGeneration
+      try {
+        await this.compactIfNeeded(agent, 'context-overflow', signal)
+      } catch {
+        // Retry only after a durable replacement, even if the final append failed.
+      }
+      if (signal.aborted || agent.session.surface.replaceGeneration <= generation) return next()
+      this.overflowRetried.add(agent.session)
+      return { kind: 'retry' }
+    })
   }
 
-  /** Effective context window for an agent (config wins; probe fallback 128000). */
+  /** Effective context window for the committed route (explicit config wins). */
   async windowFor(agent: SessionAgent): Promise<number> {
     if (this.config.modelContextLimit !== undefined) return this.config.modelContextLimit
-    const provider = agent.options.provider ?? ''
-    const model = agent.options.model ?? ''
-    const key = `${provider}\u0000${model}`
-    const cached = this.windowCache.get(key)
-    if (cached !== undefined) return cached
-    let window = DEFAULT_WINDOW
+    const route = agent.session.requestHeader()?.config ?? agent.options
     try {
-      const llm = this.engineCtx.get('llm')
-      const info = await llm?.resolveModelInfo?.(provider, model) as { context?: { contextWindow?: number } } | undefined
-      const context = info?.context?.contextWindow
-      if (typeof context === 'number' && context > 0) window = context
+      const info = await this.engineCtx.get('llm')?.resolveModelInfo?.(route.provider ?? '', route.model ?? '')
+      return info?.context?.contextWindow ?? DEFAULT_WINDOW
     } catch {
-      window = DEFAULT_WINDOW
+      return DEFAULT_WINDOW
     }
-    this.windowCache.set(key, window)
-    return window
   }
 
-  /** Current surface usage as a fraction of the effective window (0 when unmeasurable). */
-  async measureRatio(agent: SessionAgent): Promise<number> {
+  /** Price the actual or proposed durable request envelope, including completion reservation. */
+  async measureRatio(
+    agent: SessionAgent,
+    header = agent.session.requestHeader(),
+    strict = false,
+    signal?: AbortSignal,
+  ): Promise<number> {
     const meter = this.engineCtx.get('tokenMeter')
-    if (meter === undefined) return 0
-    const window = await this.windowFor(agent)
-    if (window <= 0) return 0
-    return meter.measure(agent.session).surfaceTokens / window
+    if (meter === undefined) {
+      if (strict) throw new Error('token meter unavailable')
+      return 0
+    }
+    const route = header?.config ?? agent.options
+    const info = await this.engineCtx.get('llm')?.resolveModelInfo?.(route.provider ?? '', route.model ?? '', signal)
+    const capacity = this.config.modelContextLimit ?? info?.context?.contextWindow
+    if (strict && capacity === undefined) throw new Error('target model context window unknown')
+    const window = capacity ?? DEFAULT_WINDOW
+    const reserved = header?.config.maxTokens ?? info?.defaultMaxTokens ?? 0
+    const budget = window - reserved - this.config.headroomTokens
+    if (strict && budget <= 0) throw new Error('target model output reservation leaves no input capacity')
+    const measurement = meter.measure(agent.session, header)
+    return measurement.totalTokens / Math.max(1, budget)
+  }
+
+  /** Prefer the last route that actually answered: a newly selected target may be too small. */
+  private summaryRoute(agent: SessionAgent): { provider: string; model: string } {
+    const events = agent.session.snapshotEvents()
+    for (let i = events.length - 1; i >= 0; i--) {
+      const event = events[i]
+      if (event?.type !== 'assistant/message') continue
+      const { provider, model } = event.data.message.source
+      if (provider && model) return { provider, model }
+    }
+    const route = agent.session.requestHeader()?.config ?? agent.options
+    return { provider: route.provider ?? '', model: route.model ?? '' }
   }
 
   private llmOf(): LlmLike {
@@ -198,12 +275,11 @@ export class SmartCompactEngine extends CompactionEngine {
   }
 
   /** Engine-written summary of one span using the configurable prompt. */
-  private async engineSummarizeRange(agent: SessionAgent, start: number, end: number, signal?: AbortSignal): Promise<string> {
+  private async engineSummarizeRange(agent: SessionAgent, start: number, end: number, route: { provider: string; model: string }, signal?: AbortSignal): Promise<string> {
     return summarizeRange(this.llmOf(), agent.session, start, end, {
       prompt: this.config.summaryPrompt ?? DEFAULT_SUMMARY_PROMPT,
       maxTokens: this.config.summarizationMaxTokens,
-      provider: agent.options.provider ?? '',
-      model: agent.options.model ?? '',
+      ...route,
       signal,
     })
   }
@@ -215,33 +291,12 @@ export class SmartCompactEngine extends CompactionEngine {
    * non-monotonic seqs stay correct.
    */
   private enforceProtection(session: import('@deepseek-ai/dsh-session').Session, start: number, end: number): void {
-    const nodes = session.surface.nodes
-    const startIdx = nodes.indexOf(start)
-    const endIdx = nodes.indexOf(end)
-    if (startIdx < 0 || endIdx < 0) return // resolveSurfaceRange already validated
-    for (let index = startIdx; index <= endIdx; index += 1) {
-      const event = session.events[nodes[index]!]
-      if (event === undefined) continue
-      if (isCheckpointNode(event)) {
-        throw new Error(
-          `dsh-smart-compact: span ${start}..${end} includes a compaction checkpoint (seq ${nodes[index]}) — checkpoints are never shadowed; consult dcp_status`,
-        )
-      }
-      if (this.config.protectUserMessages && event.type === 'user/message') {
-        throw new Error(
-          `dsh-smart-compact: span ${start}..${end} includes a user message (seq ${nodes[index]}) — protectUserMessages keeps user content verbatim; consult dcp_status`,
-        )
-      }
-    }
-    for (let index = nodes.length - 1; index >= 0; index -= 1) {
-      const event = session.events[nodes[index]!]
-      if (event?.type === 'user/message' && !isCheckpointNode(event)) {
-        if (index >= startIdx && index <= endIdx) {
-          throw new Error(
-            `dsh-smart-compact: span ${start}..${end} shadows the latest user message (seq ${nodes[index]}) — the last instruction is never replaced; consult dcp_status`,
-          )
-        }
-        break
+    const protectedSeqs = protectedSurfaceSeqs(session, this.rangeOpts())
+    for (const seq of shadowedSeqsOf(session, start, end)) {
+      if (protectedSeqs.has(seq)) {
+        const event = session.snapshotEvents()[seq]
+        const reason = event && isCheckpointNode(event) ? 'checkpoint' : event?.type === 'user/message' ? 'latest user message or protected user message' : 'retained or protected tool content'
+        throw new Error(`dsh-smart-compact: span includes protected seq ${seq} (${reason}); consult dcp_status`)
       }
     }
   }
@@ -283,16 +338,15 @@ export class SmartCompactEngine extends CompactionEngine {
     const shadowed = shadowedSeqsOf(session, s, e)
     let tokens = 0
     for (const seq of shadowed) {
-      const event = session.events[seq]
+      const event = session.snapshotEvents()[seq]
       if (event !== undefined) tokens += countTokens(extractEventText(event))
     }
-    const provider = agent.options.provider ?? ''
-    const model = agent.options.model ?? ''
+    const { provider, model } = this.summaryRoute(agent)
     const sourceCommandId = opts.sourceCommandId
     const bracket = beginCompaction(session, sourceCommandId)
     let summaryText: string
     try {
-      summaryText = await this.engineSummarizeRange(agent, s, e, effectiveSignal)
+      summaryText = await this.engineSummarizeRange(agent, s, e, { provider, model }, effectiveSignal)
     } catch (error) {
       const message = this.errorMessage(error)
       abortCompaction(session, bracket, message)
@@ -301,13 +355,23 @@ export class SmartCompactEngine extends CompactionEngine {
       throw this.manualError('summary', `summarization failed: ${message}`, error)
     }
     // Changed-span guard: the selected span must still be on the surface.
-    if (!shadowed.every((seq) => session.surface.nodes.includes(seq))) {
+    if (effectiveSignal.aborted) {
+      abortCompaction(session, bracket, 'compaction cancelled')
+      if (opts.manual) throw this.manualError('cancelled', 'compaction cancelled')
+      effectiveSignal.throwIfAborted()
+    }
+    if (shadowedSeqsOf(session, s, e).join(',') !== shadowed.join(',')) {
       abortCompaction(session, bracket, 'span changed during summarization')
       if (!opts.manual) throw new Error('dsh-smart-compact: span changed during summarization')
       throw this.manualError('changed', 'span changed during summarization')
     }
+    if (countTokens(summaryText) >= tokens) {
+      abortCompaction(session, bracket, 'summary does not reduce estimated tokens')
+      if (opts.manual) throw this.manualError('summary', 'summary does not reduce estimated tokens')
+      throw new Error('dsh-smart-compact: summary does not reduce estimated tokens')
+    }
     const summary: ContentBlock[] = [{ type: 'text', text: summaryText }]
-    let landed: { compactionId: CompactionId; seqs: number[] }
+    let landed: { compactionId: CompactionId; seqs: SessionSeq[] }
     try {
       landed = completeCompaction(session, bracket, {
         start: s,
@@ -339,7 +403,7 @@ export class SmartCompactEngine extends CompactionEngine {
       summarySeq: seqs[1]!,
       endSeq: seqs[3]!,
       summary,
-      shadowedRange: { start: s, end: e },
+      shadowedRange: { start: SessionSeq(s), end: SessionSeq(e) },
       shadowedSeqs: [...shadowed],
       shadowedTokenCount: tokens,
     }
@@ -353,9 +417,10 @@ export class SmartCompactEngine extends CompactionEngine {
     const shadowed = shadowedSeqsOf(session, s, e)
     let tokens = 0
     for (const seq of shadowed) {
-      const event = session.events[seq]
+      const event = session.snapshotEvents()[seq]
       if (event !== undefined) tokens += countTokens(extractEventText(event))
     }
+    if (!summaryText.trim() || countTokens(summaryText) >= tokens) throw new Error('dsh-smart-compact: summary must reduce estimated tokens')
     const summary: ContentBlock[] = [{ type: 'text', text: summaryText }]
     const { compactionId, seqs } = runCompactionTransaction(session, {
       start: s,
@@ -374,7 +439,7 @@ export class SmartCompactEngine extends CompactionEngine {
       summarySeq: seqs[1]!,
       endSeq: seqs[3]!,
       summary,
-      shadowedRange: { start: s, end: e },
+      shadowedRange: { start: SessionSeq(s), end: SessionSeq(e) },
       shadowedSeqs: [...shadowed],
       shadowedTokenCount: tokens,
     }
@@ -383,7 +448,7 @@ export class SmartCompactEngine extends CompactionEngine {
   /** The `compress` tool path: model-written summary lands a durable replace. */
   async modelCompressRange(agent: SessionAgent, start: number, end: number, summary: string): Promise<string> {
     const result = this.landWrittenRange(agent, start, end, summary.trim())
-    return `  compressed seqs ${result.shadowedRange.start}..${result.shadowedRange.end} (~${result.shadowedTokenCount} tokens reclaimed)`
+    return `  compressed seqs ${result.shadowedRange.start}..${result.shadowedRange.end} (~${result.shadowedTokenCount - countTokens(summary.trim())} net tokens saved)`
   }
 
   /** Auto-compact the largest compressible span with an engine-written summary. */

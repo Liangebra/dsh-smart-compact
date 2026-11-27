@@ -2,9 +2,10 @@ import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import { Context } from '@deepseek-ai/cordis'
 import { ManualCompactionError } from '@deepseek-ai/dsh-compaction'
+import { CONTEXT_WINDOW_EXCEEDED_CODE } from '@deepseek-ai/dsh-llm'
 import { SmartCompactEngine } from '../src/index.ts'
 import { buildCompressibleSeqRanges, rebuildBlockLedger } from '../src/region.ts'
-import { buildTextSession } from './helpers.ts'
+import { buildTextSession, appendToolCall, appendToolResult } from './helpers.ts'
 
 function fakeLlm(text: string): { stream: () => AsyncIterable<unknown> } {
   return {
@@ -65,7 +66,7 @@ test('engine: /compact (compactNow) summarizes the largest span with the custom 
   assert.equal(summaryText(result), 'SUMMARY-FROM-LLM')
   assert.ok(result.shadowedSeqs.length > 0)
   assert.ok(result.shadowedTokenCount > 0)
-  const ledger = rebuildBlockLedger(session.events)
+  const ledger = rebuildBlockLedger(session.snapshotEvents())
   assert.equal(ledger.length, 1)
 })
 
@@ -88,7 +89,7 @@ test('engine: context-overflow always auto-compacts (hard safety net)', async ()
   const result = await engine.compactIfNeeded({ session, options: {} }, 'context-overflow', new AbortController().signal)
   assert.ok(result !== null)
   assert.equal(summaryText(result), 'OVERFLOW-SUMMARY')
-  assert.equal(rebuildBlockLedger(session.events).length, 1)
+  assert.equal(rebuildBlockLedger(session.snapshotEvents()).length, 1)
 })
 
 test('engine: pressure trigger auto-compacts only at/above the mandatory line, once per turn', async () => {
@@ -126,7 +127,7 @@ test('engine: compactRegion force-compacts an explicit span', async () => {
   const result = await engine.compactRegion(nodes[0]!, nodes[3]!, { session, options: {} }, new AbortController().signal)
   assert.ok(result !== null)
   assert.equal(summaryText(result), 'REGION-SUMMARY')
-  assert.equal(rebuildBlockLedger(session.events).length, 1)
+  assert.equal(rebuildBlockLedger(session.snapshotEvents()).length, 1)
 })
 
 test('engine: modelCompressRange lands the model-written summary durably', async () => {
@@ -139,7 +140,7 @@ test('engine: modelCompressRange lands the model-written summary durably', async
   const range = ranges[0]!
   const text = await engine.modelCompressRange(agentOf(session, false), range.start, range.end, 'MODEL-WROTE-THIS')
   assert.ok(text.includes('compressed seqs'))
-  const ledger = rebuildBlockLedger(session.events)
+  const ledger = rebuildBlockLedger(session.snapshotEvents())
   assert.equal(ledger.length, 1)
   assert.equal(ledger[0]!.summary, 'MODEL-WROTE-THIS')
 })
@@ -152,9 +153,9 @@ test('engine: result seqs point at the durable bracket events', async () => {
   const session = buildTextSession(10)
   const result = await engine.compactNow(agentOf(session) as Parameters<SmartCompactEngine['compactNow']>[0], new AbortController().signal)
   assert.ok(result !== null)
-  assert.equal(session.events[result.startSeq]!.type, 'compaction/start')
-  assert.equal(session.events[result.summarySeq]!.type, 'compaction/summary')
-  assert.equal(session.events[result.endSeq]!.type, 'compaction/end')
+  assert.equal(session.snapshotEvents()[result.startSeq]!.type, 'compaction/start')
+  assert.equal(session.snapshotEvents()[result.summarySeq]!.type, 'compaction/summary')
+  assert.equal(session.snapshotEvents()[result.endSeq]!.type, 'compaction/end')
   assert.ok(result.startSeq < result.summarySeq && result.summarySeq < result.endSeq)
 })
 
@@ -173,10 +174,10 @@ test('engine: /compact classifies summarization failure as ManualCompactionError
     (error) => error instanceof ManualCompactionError && error.code === 'summary',
   )
   // The durable lock must not dangle: a compaction/end with the error follows.
-  const endEvents = session.events.filter((event) => event.type === 'compaction/end')
+  const endEvents = session.snapshotEvents().filter((event) => event.type === 'compaction/end')
   assert.equal(endEvents.length, 1)
   assert.ok((endEvents[0]!.data as { error?: string }).error !== undefined)
-  assert.equal(rebuildBlockLedger(session.events).length, 0, 'no block on failure')
+  assert.equal(rebuildBlockLedger(session.snapshotEvents()).length, 0, 'no block on failure')
 })
 
 test('engine: /compact classifies an active agent as ManualCompactionError("busy")', async () => {
@@ -212,19 +213,19 @@ test('engine: commit-stage failure closes the bracket and classifies ManualCompa
       if (endAttempts === 1) throw new Error('disk full')
     }
     return originalAppend(type, data, opts)
-  }) as typeof session.append
+  }) as unknown as typeof session.append
 
   // Manual path: classified 'commit', and the abort-end closes the lock.
   await assert.rejects(
     engine.compactNow(agentOf(session) as Parameters<SmartCompactEngine['compactNow']>[0], new AbortController().signal),
     (error) => error instanceof ManualCompactionError && error.code === 'commit',
   )
-  const starts = session.events.filter((event) => event.type === 'compaction/start').length
-  const ends = session.events.filter((event) => event.type === 'compaction/end').length
+  const starts = session.snapshotEvents().filter((event) => event.type === 'compaction/start').length
+  const ends = session.snapshotEvents().filter((event) => event.type === 'compaction/end').length
   assert.equal(starts, 1)
   assert.equal(ends, 1, 'abort-end appended: no dangling lock')
   // The summary + replace landed before the end-append failed: one block exists.
-  assert.equal(rebuildBlockLedger(session.events).length, 1)
+  assert.equal(rebuildBlockLedger(session.snapshotEvents()).length, 1)
 })
 
 test('engine: auto path survives a commit-stage failure with a closed bracket', async () => {
@@ -241,11 +242,11 @@ test('engine: auto path survives a commit-stage failure with a closed bracket', 
       if (endAttempts === 1) throw new Error('disk full')
     }
     return originalAppend(type, data, opts)
-  }) as typeof session.append
+  }) as unknown as typeof session.append
   const result = await engine.compactIfNeeded({ session, options: {} }, 'context-overflow', new AbortController().signal)
   assert.equal(result, null, 'best-effort: no result on failure')
-  const starts = session.events.filter((event) => event.type === 'compaction/start').length
-  const ends = session.events.filter((event) => event.type === 'compaction/end').length
+  const starts = session.snapshotEvents().filter((event) => event.type === 'compaction/start').length
+  const ends = session.snapshotEvents().filter((event) => event.type === 'compaction/end').length
   assert.equal(starts, 1)
   assert.equal(ends, 1, 'bracket closed on the auto path too')
 })
@@ -258,7 +259,7 @@ test('engine: protectUserMessages is enforced on direct paths too', async () => 
   const session = buildTextSession(10)
   const nodes = session.surface.nodes
   // An OLD user message inside the span must be refused by the compress path.
-  const userSeqs = nodes.filter((seq) => session.events[seq]?.type === 'user/message')
+  const userSeqs = nodes.filter((seq) => session.snapshotEvents()[seq]?.type === 'user/message')
   assert.ok(userSeqs.length >= 2)
   const oldUser = userSeqs[0]!
   await assert.rejects(
@@ -270,7 +271,7 @@ test('engine: protectUserMessages is enforced on direct paths too', async () => 
     /user message/,
   )
   // Assistant-only single-node spans still work.
-  const assistantOnly = nodes.filter((seq) => session.events[seq]?.type === 'assistant/message')
+  const assistantOnly = nodes.filter((seq) => session.snapshotEvents()[seq]?.type === 'assistant/message')
   assert.ok(assistantOnly.length >= 2)
   const result = await engine.compactRegion(assistantOnly[0]!, assistantOnly[0]!, { session, options: {} })
   assert.ok(result !== null)
@@ -287,10 +288,10 @@ test('engine: direct paths never shadow a checkpoint or the latest user message'
   await engine.modelCompressRange(agentOf(session, false), first.start, first.end, 'CHECKPOINT-1')
   const nodes = session.surface.nodes
   const sourceOf = (seq: number): { plugin?: string } | undefined =>
-    (session.events[seq]?.data as { source?: { plugin?: string } })?.source
-  const checkpoint = nodes.find((seq) => session.events[seq]?.type === 'user/message' && sourceOf(seq)?.plugin === 'compact')!
+    (session.snapshotEvents()[seq]?.data as { source?: { plugin?: string } })?.source
+  const checkpoint = nodes.find((seq) => session.snapshotEvents()[seq]?.type === 'user/message' && (sourceOf(seq) as { kind?: string })?.kind === 'compact-checkpoint')!
   assert.ok(checkpoint !== undefined, 'checkpoint present')
-  const lastUser = [...nodes].reverse().find((seq) => session.events[seq]?.type === 'user/message' && sourceOf(seq)?.plugin !== 'compact')!
+  const lastUser = [...nodes].reverse().find((seq) => session.snapshotEvents()[seq]?.type === 'user/message' && (sourceOf(seq) as { kind?: string })?.kind !== 'compact-checkpoint')!
   assert.ok(lastUser !== undefined, 'last user message present')
   await assert.rejects(
     engine.compactRegion(checkpoint, checkpoint, { session, options: {} }),
@@ -304,5 +305,120 @@ test('engine: direct paths never shadow a checkpoint or the latest user message'
     engine.modelCompressRange(agentOf(session, false), checkpoint, checkpoint, 'NOPE'),
     /checkpoint/,
   )
-  assert.equal(rebuildBlockLedger(session.events).length, 1, 'no new block from refused spans')
+  assert.equal(rebuildBlockLedger(session.snapshotEvents()).length, 1, 'no new block from refused spans')
+})
+
+test('engine: pressure includes request overhead and reserves model output', async () => {
+  const ctx = new Context()
+  ctx.provide('llm', {
+    ...fakeLlm('unused'),
+    resolveModelInfo: async () => ({ context: { contextWindow: 100000 }, defaultMaxTokens: 20000 }),
+  })
+  ctx.provide('tokenMeter', { measure: () => ({ totalTokens: 60000, surfaceTokens: 10000 }) })
+  const engine = engineWith(ctx, { headroomTokens: 5000 })
+  const session = buildTextSession(10)
+  assert.equal(await engine.measureRatio(agentOf(session)), 60000 / 75000)
+})
+
+test('engine: direct compression cannot replace protected tool pairs', async () => {
+  const ctx = new Context()
+  const engine = engineWith(ctx, { protectedTools: ['bash'], preserveRecent: 0 })
+  const session = buildTextSession(2)
+  appendToolCall(session, 'call', 'protected')
+  appendToolResult(session, 'large output '.repeat(100), 'protected')
+  const nodes = session.surface.nodes
+  await assert.rejects(engine.modelCompressRange(agentOf(session), nodes[2]!, nodes[3]!, 'summary'), /protected seq/)
+})
+test('engine: streamed block completion does not duplicate the summary', async () => {
+  const ctx = new Context()
+  ctx.provide('llm', {
+    async *stream() {
+      yield { type: 'text-delta', index: 0, text: 'SUMMARY' }
+      yield { type: 'block-end', index: 0, block: { type: 'text', text: 'SUMMARY' } }
+    },
+  })
+  const engine = engineWith(ctx)
+  const session = buildTextSession(10)
+  const result = await engine.compactNow(agentOf(session) as Parameters<SmartCompactEngine['compactNow']>[0], new AbortController().signal)
+  assert.ok(result)
+  assert.equal(summaryText(result), 'SUMMARY')
+})
+
+test('lifecycle: mandatory pre-step compaction runs even with advisory nudges disabled', async () => {
+  const ctx = new Context()
+  ctx.provide('llm', fakeLlm('COMPRESSED'))
+  ctx.provide('tokenMeter', fakeMeter(95000))
+  engineWith(ctx, { autoNudge: false })
+  const session = buildTextSession(10)
+  const agent = agentOf(session)
+  const payload = { agent, modelSelection: agent.options, turn: 1, step: 1, messages: [],
+    signal: new AbortController().signal }
+  const decision = await ctx.waterfall('agent/pre-step', payload as never,
+    async () => ({ kind: 'enter' as const, messages: [] }))
+  assert.equal(decision.kind, 'enter')
+  assert.equal(rebuildBlockLedger(session.snapshotEvents()).length, 1)
+})
+
+test('lifecycle: overflow requests retry only after durable progress and at most once', async () => {
+  const ctx = new Context()
+  ctx.provide('llm', fakeLlm('COMPRESSED'))
+  ctx.provide('tokenMeter', fakeMeter(1000))
+  engineWith(ctx)
+  const session = buildTextSession(10)
+  const payload = { agent: agentOf(session), failure: { code: CONTEXT_WINDOW_EXCEEDED_CODE },
+    signal: new AbortController().signal }
+  const fallback = async () => ({ kind: 'fail' as const })
+  let delegated = 0
+  const next = async () => { delegated++; return fallback() }
+  const first = await ctx.waterfall('agent/request-error', payload as never, next as never)
+  assert.deepEqual(first, { kind: 'retry' })
+  assert.equal(rebuildBlockLedger(session.snapshotEvents()).length, 1)
+  await ctx.waterfall('agent/request-error', payload as never, next as never)
+  assert.equal(delegated, 1)
+})
+
+test('routing: compacts for the proposed smaller model using the last answered model', async () => {
+  const ctx = new Context()
+  let summaryModel: string | undefined
+  ctx.provide('llm', {
+    resolveModelInfo: async (_provider: string, model: string) =>
+      ({ context: { contextWindow: model === 'small' ? 30000 : 100000 } }),
+    async *stream(options: { model: string }) {
+      summaryModel = options.model
+      yield { type: 'text-delta', index: 0, text: 'COMPRESSED' }
+    },
+  })
+  const session = buildTextSession(10)
+  session.requestHeader = () => ({
+    config: { provider: 'test-provider', model: 'test-model' },
+  } as ReturnType<typeof session.requestHeader>)
+  const initialSize = session.surface.nodes.length
+  ctx.provide('tokenMeter', { measure: (_session: unknown, header?: { config: { model: string } }) => {
+    assert.equal(header?.config.model, 'small')
+    return { totalTokens: session.surface.nodes.length < initialSize ? 10000 : 28000 }
+  } })
+  new SmartCompactEngine(ctx, { autoTools: false, autoNudge: false, headroomTokens: 0 })
+  const target = { provider: 'test-provider', model: 'small', maxTokens: 5000 }
+  const agent = agentOf(session)
+  const payload = { agent, signal: new AbortController().signal }
+  const result = await ctx.waterfall('agent/request', payload as never, async () => target as never)
+  assert.deepEqual(result, target)
+  assert.equal(summaryModel, 'test-model')
+  assert.equal(rebuildBlockLedger(session.snapshotEvents()).length, 1)
+})
+
+test('routing: rejects an unsafe switch when no safe span can be compressed', async () => {
+  const ctx = new Context()
+  ctx.provide('llm', { ...fakeLlm('unused'),
+    resolveModelInfo: async () => ({ context: { contextWindow: 10000 } }) })
+  ctx.provide('tokenMeter', fakeMeter(20000))
+  const session = buildTextSession(2)
+  session.requestHeader = () => ({
+    config: { provider: 'test-provider', model: 'test-model' },
+  } as ReturnType<typeof session.requestHeader>)
+  new SmartCompactEngine(ctx, { autoTools: false, autoNudge: false, headroomTokens: 0 })
+  const payload = { agent: agentOf(session), signal: new AbortController().signal }
+  await assert.rejects(ctx.waterfall('agent/request', payload as never,
+    async () => ({ provider: 'test-provider', model: 'small' }) as never), /Cannot switch/)
+  assert.equal(rebuildBlockLedger(session.snapshotEvents()).length, 0)
 })

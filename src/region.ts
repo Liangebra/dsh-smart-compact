@@ -8,8 +8,8 @@
  */
 
 import { randomUUID } from 'node:crypto'
-import type { Session, SessionEvent } from '@deepseek-ai/dsh-session'
-import type { CommandId } from '@deepseek-ai/dsh-commands/brand'
+import { SessionSeq, type Session, type SessionEvent } from '@deepseek-ai/dsh-session'
+import type { CommandId } from '@deepseek-ai/dsh-commands/types'
 import {
   CompactionId,
   compactCheckpointSource,
@@ -30,6 +30,8 @@ export interface BlockLedgerEntry {
   readonly start: number
   readonly end: number
   readonly createdAt: number
+  readonly summaryTokens: number
+  readonly estimatedNetTokens: number
 }
 
 /** One self-computed compressible span of the current surface. */
@@ -56,10 +58,10 @@ export interface CompactionTransactionInput {
 }
 
 /** The seqs of the surface nodes in the inclusive positional span. */
-export function shadowedSeqsOf(session: Session, start: number, end: number): number[] {
+export function shadowedSeqsOf(session: Session, start: number, end: number): SessionSeq[] {
   const nodes = session.surface.nodes
-  const startIdx = nodes.indexOf(start)
-  const endIdx = nodes.indexOf(end)
+  const startIdx = nodes.indexOf(SessionSeq(start))
+  const endIdx = nodes.indexOf(SessionSeq(end))
   if (startIdx < 0 || endIdx < 0) return []
   return nodes.slice(startIdx, endIdx + 1)
 }
@@ -67,7 +69,7 @@ export function shadowedSeqsOf(session: Session, start: number, end: number): nu
 /** An opened durable bracket: `compaction/start` is already in the log. */
 export interface OpenBracket {
   readonly compactionId: CompactionId
-  readonly startSeq: number
+  readonly startSeq: SessionSeq
   readonly turn: number | null
 }
 
@@ -76,7 +78,7 @@ export function beginCompaction(
   session: Session,
   sourceCommandId?: CommandId,
 ): OpenBracket {
-  const turn = findOpenTurn(session.events)
+  const turn = findOpenTurn(session.snapshotEvents())
   const compactionId = CompactionId(randomUUID())
   const event = session.append('compaction/start', {
     compactionId,
@@ -91,13 +93,13 @@ export function completeCompaction(
   session: Session,
   bracket: OpenBracket,
   input: CompactionTransactionInput,
-): { compactionId: CompactionId; seqs: number[] } {
-  const seqs: number[] = [bracket.startSeq]
+): { compactionId: CompactionId; seqs: SessionSeq[] } {
+  const seqs: SessionSeq[] = [bracket.startSeq]
   const summaryBase = {
     compactionId: bracket.compactionId,
     summary: input.summary,
-    shadowedRange: { start: input.start, end: input.end },
-    shadowedSeqs: [...input.shadowedSeqs],
+    shadowedRange: { start: SessionSeq(input.start), end: SessionSeq(input.end) },
+    shadowedSeqs: input.shadowedSeqs.map(SessionSeq),
     shadowedTokenCount: input.shadowedTokenCount,
     provider: input.provider,
     model: input.model,
@@ -112,8 +114,8 @@ export function completeCompaction(
     source: compactCheckpointSource(bracket.compactionId, input.sourceCommandId),
   })
   seqs.push(session.append('user/message', message, {
-    surfaceOp: { op: 'replace', start: input.start, end: input.end },
-    sourceEventSeqs: [...input.shadowedSeqs],
+    surfaceOp: { op: 'replace', startSeq: SessionSeq(input.start), endSeq: SessionSeq(input.end) },
+    sourceEventSeqs: [bracket.startSeq, seqs[1]!, ...input.shadowedSeqs.map(SessionSeq)],
   }).seq)
 
   seqs.push(session.append('compaction/end', {
@@ -137,7 +139,7 @@ export function abortCompaction(session: Session, bracket: OpenBracket, error?: 
 export function runCompactionTransaction(
   session: Session,
   input: CompactionTransactionInput,
-): { compactionId: CompactionId; seqs: number[] } {
+): { compactionId: CompactionId; seqs: SessionSeq[] } {
   const bracket = beginCompaction(session, input.sourceCommandId)
   return completeCompaction(session, bracket, input)
 }
@@ -146,7 +148,7 @@ export function runCompactionTransaction(
 export function isCheckpointNode(event: SessionEvent): boolean {
   if (event.type !== 'user/message') return false
   const source = (event.data as { source?: { plugin?: string } }).source
-  return source?.plugin === 'compact'
+  return source?.plugin === 'compact' || (source as { kind?: string } | undefined)?.kind === 'compact-checkpoint'
 }
 
 /** Rebuild the block ledger from the log (authoritative, kernel-free). */
@@ -171,9 +173,13 @@ export function rebuildBlockLedger(events: readonly SessionEvent[]): BlockLedger
         if (original !== undefined) shadowedTokenCount += countTokens(extractEventText(original))
       }
     }
+    const summary = extractText(Array.isArray(data.summary) ? data.summary : [])
+    const summaryTokens = countTokens(summary)
     ledger.push({
       blockId: data.compactionId,
-      summary: extractText(Array.isArray(data.summary) ? data.summary : []),
+      summary,
+      summaryTokens,
+      estimatedNetTokens: shadowedTokenCount - summaryTokens,
       shadowedSeqs,
       shadowedTokenCount,
       start: data.shadowedRange?.start ?? 0,
@@ -216,13 +222,12 @@ function nearestNode(session: Session, seq: number): number | undefined {
  */
 export function resolveSurfaceRange(session: Session, start: number, end: number): { start: number; end: number } {
   const nodes = session.surface.nodes
-  if (start > end) throw new Error(`dsh-smart-compact: reversed range ${start}..${end}`)
   let s = start
   let e = end
-  if (nodes.indexOf(s) < 0) s = nearestNode(session, s) ?? s
-  if (nodes.indexOf(e) < 0) e = nearestNode(session, e) ?? e
-  let startIdx = nodes.indexOf(s)
-  let endIdx = nodes.indexOf(e)
+  if (nodes.indexOf(SessionSeq(s)) < 0) s = nearestNode(session, s) ?? s
+  if (nodes.indexOf(SessionSeq(e)) < 0) e = nearestNode(session, e) ?? e
+  let startIdx = nodes.indexOf(SessionSeq(s))
+  let endIdx = nodes.indexOf(SessionSeq(e))
   if (startIdx < 0 || endIdx < 0) {
     throw new Error(`dsh-smart-compact: seq ${start}..${end} not in the current surface — consult dcp_status`)
   }
@@ -234,16 +239,16 @@ export function resolveSurfaceRange(session: Session, start: number, end: number
   // Pass 1: shrink inward to the nearest clean cuts.
   while (startIdx <= endIdx && !cleanBefore(startIdx)) startIdx += 1
   while (endIdx >= startIdx && !cleanAfter(endIdx)) endIdx -= 1
-  if (startIdx <= endIdx && nodes[startIdx]! <= nodes[endIdx]!) {
+  if (startIdx <= endIdx) {
     return { start: nodes[startIdx]!, end: nodes[endIdx]! }
   }
 
   // Pass 2: expand outward from the requested span to the smallest clean pair.
-  startIdx = nodes.indexOf(s)
-  endIdx = nodes.indexOf(e)
+  startIdx = nodes.indexOf(SessionSeq(s))
+  endIdx = nodes.indexOf(SessionSeq(e))
   while (startIdx > 0 && !cleanBefore(startIdx)) startIdx -= 1
   while (endIdx < nodes.length - 1 && !cleanAfter(endIdx)) endIdx += 1
-  if (cleanBefore(startIdx) && cleanAfter(endIdx) && nodes[startIdx]! <= nodes[endIdx]!) {
+  if (cleanBefore(startIdx) && cleanAfter(endIdx)) {
     return { start: nodes[startIdx]!, end: nodes[endIdx]! }
   }
   throw new Error(`dsh-smart-compact: no tool-pairing-balanced range around ${start}..${end} — narrow the range`)
@@ -266,43 +271,8 @@ export function buildCompressibleSeqRanges(
   } = {},
 ): SeqCompressibleRange[] {
   const nodes = session.surface.nodes
-  const preserve = opts.preserveRecent ?? 5
-  const protectedToolNames = new Set(opts.protectedToolNames ?? [])
+  const protectedSeqs = protectedSurfaceSeqs(session, opts)
   const protectUserMessages = opts.protectUserMessages === true
-  const protectedSeqs = new Set<number>()
-  for (const seq of nodes.slice(-preserve)) protectedSeqs.add(seq)
-  for (let index = nodes.length - 1; index >= 0; index -= 1) {
-    const event = session.events[nodes[index]!]
-    if (event?.type === 'user/message' && !isCheckpointNode(event)) {
-      protectedSeqs.add(nodes[index]!)
-      break
-    }
-  }
-  // Protect named tool pairs: the call node and every paired result node.
-  if (protectedToolNames.size > 0) {
-    const callIds = new Set<string>()
-    for (const seq of nodes) {
-      const event = session.events[seq]
-      if (event?.type !== 'assistant/message') continue
-      const content = (event.data as { message?: { content?: Array<{ type?: string; name?: string; id?: string }> } })
-        .message?.content
-      for (const block of content ?? []) {
-        if (block.type === 'tool-call' && block.name !== undefined && protectedToolNames.has(block.name)) {
-          protectedSeqs.add(seq)
-          if (block.id !== undefined) callIds.add(block.id)
-        }
-      }
-    }
-    if (callIds.size > 0) {
-      for (const seq of nodes) {
-        const event = session.events[seq]
-        if (event?.type !== 'tool/result') continue
-        const message = (event.data as { message?: { callId?: string; source?: { callId?: string } } }).message
-        const callId = message?.callId ?? message?.source?.callId
-        if (callId !== undefined && callIds.has(callId)) protectedSeqs.add(seq)
-      }
-    }
-  }
   const raw: SeqCompressibleRange[] = []
   let cur: SeqCompressibleRange | null = null
   const flush = (): void => {
@@ -310,15 +280,11 @@ export function buildCompressibleSeqRanges(
     cur = null
   }
   for (const seq of nodes) {
-    const event = session.events[seq]
+    const event = session.snapshotEvents()[seq]
     const isUser = event?.type === 'user/message' && !isCheckpointNode(event)
     if (event === undefined || protectedSeqs.has(seq) || isCheckpointNode(event) || (protectUserMessages && isUser)) {
       flush()
       continue
-    }
-    if (cur !== null && seq < cur.start) {
-      flush()
-      cur = null
     }
     const tokens = countTokens(extractEventText(event))
     if (cur === null) {
@@ -332,10 +298,61 @@ export function buildCompressibleSeqRanges(
   for (const range of raw) {
     try {
       const { start, end } = resolveSurfaceRange(session, range.start, range.end)
-      out.push({ start, end, count: range.count, tokens: range.tokens })
+      const selected = shadowedSeqsOf(session, start, end)
+      const original = new Set(shadowedSeqsOf(session, range.start, range.end))
+      if (selected.some(seq => !original.has(seq))) continue
+      const tokens = selected.reduce((sum, seq) => sum + countTokens(extractEventText(session.snapshotEvents()[seq]!)), 0)
+      out.push({ start, end, count: selected.length, tokens })
     } catch {
       // Cannot be balanced into a compressible span — skip.
     }
   }
   return out.sort((a, b) => b.tokens - a.tokens)
+}
+
+/** Shared retention rules for automatic and model-directed compression. */
+export function protectedSurfaceSeqs(session: Session, opts: { preserveRecent?: number; protectedToolNames?: readonly string[]; protectUserMessages?: boolean } = {}): Set<number> {
+  const nodes = session.surface.nodes
+  const preserve = opts.preserveRecent ?? 5
+  const protectedToolNames = new Set(opts.protectedToolNames ?? [])
+  const protectUserMessages = opts.protectUserMessages === true
+  const protectedSeqs = new Set<number>()
+  for (const seq of preserve > 0 ? nodes.slice(-preserve) : []) protectedSeqs.add(seq)
+  for (let index = nodes.length - 1; index >= 0; index -= 1) {
+    const event = session.snapshotEvents()[nodes[index]!]
+    if (event?.type === 'user/message' && !isCheckpointNode(event)) {
+      protectedSeqs.add(nodes[index]!)
+      break
+    }
+  }
+  // Protect named tool pairs: the call node and every paired result node.
+  if (protectedToolNames.size > 0) {
+    const callIds = new Set<string>()
+    for (const seq of nodes) {
+      const event = session.snapshotEvents()[seq]
+      if (event?.type !== 'assistant/message') continue
+      const content = (event.data as { message?: { content?: ReadonlyArray<{ type?: string; name?: string; id?: string }> } })
+        .message?.content
+      for (const block of content ?? []) {
+        if (block.type === 'tool-call' && block.name !== undefined && protectedToolNames.has(block.name)) {
+          protectedSeqs.add(seq)
+          if (block.id !== undefined) callIds.add(block.id)
+        }
+      }
+    }
+    if (callIds.size > 0) {
+      for (const seq of nodes) {
+        const event = session.snapshotEvents()[seq]
+        if (event?.type !== 'tool/result') continue
+        const message = (event.data as { message?: { callId?: string; source?: { callId?: string } } }).message
+        const callId = message?.callId ?? message?.source?.callId
+        if (callId !== undefined && callIds.has(callId)) protectedSeqs.add(seq)
+      }
+    }
+  }
+  for (const seq of nodes) {
+    const event = session.snapshotEvents()[seq]
+    if (event === undefined || isCheckpointNode(event) || (protectUserMessages && event.type === 'user/message')) protectedSeqs.add(seq)
+  }
+  return protectedSeqs
 }

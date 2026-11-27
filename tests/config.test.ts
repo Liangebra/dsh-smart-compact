@@ -42,3 +42,9 @@ test('tokens: CJK-aware estimation (1 char/token CJK, 4 chars/token otherwise)',
   assert.equal(countTokens('a'.repeat(100)), 25)
   assert.equal(countTokens('中'.repeat(50) + 'a'.repeat(40)), 60)
 })
+
+ test('config: validates context budget headroom', () => {
+  assert.equal(resolveConfig({ headroomTokens: 0 }).headroomTokens, 0)
+  assert.throws(() => resolveConfig({ headroomTokens: -1 }))
+  assert.throws(() => resolveConfig({ modelContextLimit: 0 }))
+})

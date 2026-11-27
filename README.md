@@ -2,7 +2,7 @@
 
 ![License: MIT](https://img.shields.io/badge/license-MIT-green.svg)
 ![DSH plugin](https://img.shields.io/badge/DeepSeek%20Harness-plugin-1f6feb.svg)
-![Tests: 33/33](https://img.shields.io/badge/tests-33%2F33-brightgreen.svg)
+[![CI](https://github.com/Liangebra/dsh-smart-compact/actions/workflows/ci.yml/badge.svg)](https://github.com/Liangebra/dsh-smart-compact/actions/workflows/ci.yml)
 
 # dsh-smart-compact
 
@@ -38,7 +38,7 @@ always sees a consistent picture.
 
 ## Upstream compatibility
 
-This implementation was developed against DSH `0.1.0-rc.6`. The current upstream source (`0.2.3-alpha.2` at review time) adds routed-request pressure accounting, output headroom, model-switch compaction and optional tool-result pruning. Compatibility with that version has not yet been validated; the mount example below describes the original manual composition, not a verified marketplace installation. See the [upstream compaction reference](https://github.com/deepseek-ai/deepseek-harness/tree/master/packages/compaction/compaction-basic).
+This release targets DSH `0.2.3-alpha.2` and Node.js 24+. The exact published DSH packages are pinned in the manifest and lockfile. CI installs the checked-in dependency graph, type-checks, tests, builds, and checks the package contents. Compatibility with later releases, the plugin marketplace, and real-provider end-to-end sessions is not yet established. The mount example below describes manual composition. See the [upstream compaction reference](https://github.com/deepseek-ai/deepseek-harness/tree/master/packages/compaction/compaction-basic).
 
 ## Mount
 
@@ -70,11 +70,12 @@ composition change (the web profile runs without HMR).
 | Option | Default | Meaning |
 |---|---|---|
 | `thresholdRatio` | `0.5` | Context-usage fraction where the advisory nudge appears (`agent/pre-step`); the model decides whether to use the `compress` tool. |
+| `headroomTokens` | `4096` | Additional input headroom after reserving the routed model's output budget. |
 | `mandatoryRatio` | `0.9` | At/above this the engine auto-compacts the largest compressible span once per turn. |
-| `summarizationMaxTokens` | `8192` | Generation cap for the direct `ctx.llm.stream` summary call (`purpose: 'compaction'`). |
-| `preserveRecent` | `5` | Number of newest surface nodes never auto-compressed. |
+| `summarizationMaxTokens` | `8192` | Generation cap for the direct `ctx.llm.stream` summary call . |
+| `preserveRecent` | `5` | Number of newest surface nodes protected from compression. |
 | `dedupEnabled` | `true` | Offer DCP-style dedup suggestions in `dcp_status`. |
-| `purgeErroredTurns` | `4` | Offer purge suggestions for the N most recent errored turns. |
+| `purgeErroredTurns` | `4` | Offer purge suggestions for errored calls at least N turns old; zero disables them. |
 | `protectedTools` | `[]` | Tool names whose call/result pairs are never compressed. |
 | `protectUserMessages` | `false` | Keep every user message verbatim (never compress them). |
 | `summaryPrompt` | built-in | Full prompt template; `{content}` is replaced with the span text. |
@@ -85,12 +86,13 @@ composition change (the web profile runs without HMR).
 ## Behavior
 
 - **Threshold prompting** — a short advisory nudge is injected once the
-  surface usage crosses `thresholdRatio`. The system prompt section explains
+  estimated total input usage crosses `thresholdRatio`. The system prompt section explains
   the `compress` tool (`range`/`message` modes) and points at `dcp_status`.
 - **Mandatory auto-compaction** — when usage reaches `mandatoryRatio` (or the
   provider confirms `context-overflow`), the engine auto-compacts the largest
   compressible span with an engine-written summary. This is a **hard safety
-  net**, gated once per turn.
+  net**, gated once per turn for normal pressure; overflow recovery retries only after durable surface progress, at most once until a successful response or idle state.
+- **Model switching** — price the proposed routed request including its reserved output tokens, try up to three safe reductions, and reject a switch if the mandatory threshold cannot be met. Summaries use the last model that actually answered, when available.
 - **`/compact`** — engine-driven LLM summary of the largest compressible span,
   serialized against driver turns via `runMaintenance`; failures surface as
   classified `ManualCompactionError`s (`busy`, `cancelled`, `changed`,
@@ -107,7 +109,7 @@ composition change (the web profile runs without HMR).
 ## Development
 
 ```bash
-npm install
+npm ci
 npm run typecheck
 npm test        # node --import tsx --test tests/*.test.ts
 npm run build
