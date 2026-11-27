@@ -4,7 +4,11 @@ import { dedupSuggestions, purgeSuggestions } from '../src/dcp.ts'
 import { buildTextSession, buildToolSession, appendToolCall, appendToolResult, appendTurn, appendUser, appendAssistant } from './helpers.ts'
 
 test('dcp: dedup suggests the older duplicate of a repeated tool call', () => {
-  const session = buildToolSession()
+  const session = buildTextSession(2)
+  appendToolCall(session, 'calling', 'same-1')
+  appendToolResult(session, 'identical output', 'same-1')
+  appendToolCall(session, 'calling again', 'same-2')
+  appendToolResult(session, 'identical output', 'same-2')
   const suggestions = dedupSuggestions(session)
   const dedup = suggestions.filter((suggestion) => suggestion.kind === 'dedup')
   assert.ok(dedup.length >= 1, 'older duplicate suggested')
@@ -46,4 +50,8 @@ test('dcp: purge is disabled with turns=0 and skips recent/clean results', () =>
   appendTurn(session3, 5)
   appendUser(session3, 'far later')
   assert.equal(purgeSuggestions(session3, 4).length, 0)
+})
+
+test('dcp: changed output is not redundant even with identical arguments', () => {
+  assert.equal(dedupSuggestions(buildToolSession()).length, 0)
 })
