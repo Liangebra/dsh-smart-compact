@@ -32,10 +32,16 @@ import {
   type CompactionTrigger,
   type ManualCompactAgentContext,
 } from '@deepseek-ai/dsh-compaction'
-import type { Agent } from '@deepseek-ai/dsh-agent'
+import type {} from '@deepseek-ai/dsh-agent'
 import type { Context } from '@deepseek-ai/cordis'
 import type { CommandId } from '@deepseek-ai/dsh-commands/types'
-import { createUserMessage, type ContentBlock } from '@deepseek-ai/dsh-llm'
+import { CONTEXT_WINDOW_EXCEEDED_CODE, createUserMessage, type ContentBlock } from '@deepseek-ai/dsh-llm'
+
+declare module '@deepseek-ai/dsh-llm' {
+  interface MessageSourceMap {
+    'smart-compact-nudge': { kind: 'smart-compact-nudge' }
+  }
+}
 import { resolveConfig, type SmartCompactConfig } from './config.ts'
 import { DEFAULT_SUMMARY_PROMPT, buildSummaryPrompt } from './prompt.ts'
 import { summarizeRange, type LlmLike } from './summarize.ts'
@@ -78,6 +84,7 @@ export class SmartCompactEngine extends CompactionEngine {
   private readonly lastAutoCompactTurn = new Map<string, number>()
   /** Runtime-only cadence guard so the threshold nudge appears once per turn. */
   private readonly lastNudgeTurn = new Map<string, number>()
+  private readonly overflowRetried = new WeakSet<SessionAgent['session']>()
 
   private rangeOpts(): { preserveRecent: number; protectedToolNames: readonly string[]; protectUserMessages: boolean } {
     return {
@@ -123,10 +130,16 @@ export class SmartCompactEngine extends CompactionEngine {
       systemPrompt.section({ name: 'dsh-smart-compact', order: 200, text: SYSTEM_PROMPT_SECTION })
     }
 
-    if (this.config.autoNudge) {
-      ctx.on('agent/pre-step', async (payload: { agent: Agent; turn: number }, next) => {
+    ctx.on('agent/pre-step', async (payload, next) => {
+        if (!payload.signal.aborted) {
+          try {
+            await this.compactIfNeeded(payload.agent, 'pressure', payload.signal)
+          } catch {
+            // Pressure recovery is best-effort; keep the original step available.
+          }
+        }
         const decision = await next()
-        if (decision.kind === 'reject') return decision
+        if (!this.config.autoNudge || payload.signal.aborted || decision.kind === 'reject') return decision
         let ratio = 0
         try {
           ratio = await this.measureRatio(payload.agent)
@@ -156,11 +169,30 @@ export class SmartCompactEngine extends CompactionEngine {
               suggestions,
             }),
           }],
-          source: { kind: 'user' },
+          source: { kind: 'smart-compact-nudge' },
         })
-        return { kind: 'enter', messages: [...decision.messages, message] }
-      })
-    }
+        return { ...decision, messages: [...decision.messages, message] }
+    })
+
+    ctx.on('agent/status', ({ agent, status }) => {
+      if (status === 'idle') this.overflowRetried.delete(agent.session)
+    })
+    ctx.on('session/event', (session, event) => {
+      if (event.type === 'assistant/message') this.overflowRetried.delete(session)
+    })
+    ctx.on('agent/request-error', async ({ agent, failure, signal }, next) => {
+      if (failure.code !== CONTEXT_WINDOW_EXCEEDED_CODE || signal.aborted
+          || this.overflowRetried.has(agent.session)) return next()
+      const generation = agent.session.surface.replaceGeneration
+      try {
+        await this.compactIfNeeded(agent, 'context-overflow', signal)
+      } catch {
+        // Retry only after a durable replacement, even if the final append failed.
+      }
+      if (signal.aborted || agent.session.surface.replaceGeneration <= generation) return next()
+      this.overflowRetried.add(agent.session)
+      return { kind: 'retry' }
+    })
   }
 
   /** Effective context window for an agent (config wins; probe fallback 128000). */
