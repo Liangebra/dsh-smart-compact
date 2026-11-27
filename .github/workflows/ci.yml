@@ -12,23 +12,14 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: 24
-      - name: Resolve published modern DSH dependencies
+      - name: Resolve lockfile from the checked-in manifest
         run: |
-          npm view @deepseek-ai/dsh-compaction dist-tags --json
+          npm install --package-lock-only --ignore-scripts
           node --input-type=module <<'JS'
           import fs from 'node:fs'
-          const p = JSON.parse(fs.readFileSync('package.json', 'utf8'))
-          for (const section of ['peerDependencies', 'devDependencies']) {
-            for (const name of Object.keys(p[section])) {
-              if (name.startsWith('@deepseek-ai/dsh-')) p[section][name] = '0.2.3-alpha.2'
-            }
-            p[section]['@deepseek-ai/dsh-commands'] = '0.2.3-alpha.2'
-            p[section]['@deepseek-ai/cordis'] = '4.2.0-alpha.1'
-            p[section]['@deepseek-ai/schemastery'] = '3.20.0-alpha.1'
-          }
-          fs.writeFileSync('package.json', JSON.stringify(p, null, 2))
+          const lock = fs.readFileSync('package-lock.json').toString('base64')
+          for (let i = 0; i < lock.length; i += 3000) console.log('LOCK_CHUNK:' + lock.slice(i, i + 3000))
           JS
-          npm install --package-lock-only --ignore-scripts
           npm ci
       - run: npm run typecheck
       - run: npm test
