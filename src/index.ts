@@ -377,7 +377,7 @@ export class SmartCompactEngine extends CompactionEngine {
   /** The `compress` tool path: model-written summary lands a durable replace. */
   async modelCompressRange(agent: SessionAgent, start: number, end: number, summary: string): Promise<string> {
     const result = this.landWrittenRange(agent, start, end, summary.trim())
-    return `  compressed seqs ${result.shadowedRange.start}..${result.shadowedRange.end} (~${result.shadowedTokenCount} tokens reclaimed)`
+    return `  compressed seqs ${result.shadowedRange.start}..${result.shadowedRange.end} (~${result.shadowedTokenCount - countTokens(summary.trim())} net tokens saved)`
   }
 
   /** Auto-compact the largest compressible span with an engine-written summary. */
