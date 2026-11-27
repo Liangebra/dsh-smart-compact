@@ -12,15 +12,7 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: 24
-      - name: Resolve lockfile from the checked-in manifest
-        run: |
-          npm install --package-lock-only --ignore-scripts
-          node --input-type=module <<'JS'
-          import fs from 'node:fs'
-          const lock = fs.readFileSync('package-lock.json').toString('base64')
-          for (let i = 0; i < lock.length; i += 3000) console.log('LOCK_CHUNK:' + lock.slice(i, i + 3000))
-          JS
-          npm ci
+      - run: npm ci
       - run: npm run typecheck
       - run: npm test
       - run: npm run build
