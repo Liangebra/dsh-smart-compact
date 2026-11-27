@@ -182,15 +182,25 @@ export class SmartCompactEngine extends CompactionEngine {
     return window
   }
 
-  /** Current surface usage as a fraction of the effective window (0 when unmeasurable). */
+  /** Price the committed route when available; older hosts fall back to agent options. */
   async measureRatio(agent: SessionAgent): Promise<number> {
     const meter = this.engineCtx.get('tokenMeter')
     if (meter === undefined) return 0
-    const window = await this.windowFor(agent)
-    if (window <= 0) return 0
+    const session = agent.session as SessionAgent['session'] & {
+      requestHeader?: () => { config: { provider?: string; model?: string; maxTokens?: number } } | undefined
+    }
+    const header = session.requestHeader?.()
+    const route = header?.config ?? agent.options
+    const provider = route.provider ?? ''
+    const model = route.model ?? ''
+    const info = await this.engineCtx.get('llm')?.resolveModelInfo?.(provider, model) as {
+      context?: { contextWindow?: number }; defaultMaxTokens?: number
+    } | undefined
+    const window = this.config.modelContextLimit ?? info?.context?.contextWindow ?? DEFAULT_WINDOW
+    const reserved = header?.config.maxTokens ?? info?.defaultMaxTokens ?? 0
     const measurement = meter.measure(agent.session) as { surfaceTokens: number; totalTokens?: number }
     const input = measurement.totalTokens ?? measurement.surfaceTokens
-    const budget = Math.max(1, window - this.config.summarizationMaxTokens - this.config.headroomTokens)
+    const budget = Math.max(1, window - reserved - this.config.headroomTokens)
     return input / budget
   }
 
