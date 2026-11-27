@@ -129,7 +129,7 @@ export function makeTools(env: CompressEnv): ToolDefinition[] {
         ...(env.config.dedupEnabled ? dedupSuggestions(session) : []),
         ...purgeSuggestions(session, env.config.purgeErroredTurns),
       ]
-      const blocks = rebuildBlockLedger(session.events)
+      const blocks = rebuildBlockLedger(session.snapshotEvents())
       const lines: string[] = [
         `context usage: ${Math.round(ratio * 100)}% (threshold ${Math.round(env.config.thresholdRatio * 100)}%, mandatory ${Math.round(env.config.mandatoryRatio * 100)}%)`,
         `surface nodes: ${session.surface.nodes.length}, blocks: ${blocks.length}`,
